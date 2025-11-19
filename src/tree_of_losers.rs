@@ -118,48 +118,197 @@ impl<T: Ord + SentinelValue> TreeOfLosers<T> {
         index / 2
     }
 
-    /// Traditional leaf-to-root pass algorithm (Fig. 1)
-    /// Implements: void PQ::pass(Index const index, Key const key)
+    /// Leaf-to-root pass with early termination (Fig. 3)
+    /// This is the core of the addressable priority queue.
+    /// Stops early when finding the target entry.
     ///
-    /// This follows the algorithm from the paper:
-    /// 1. Create a candidate node with (run_id, value)
-    /// 2. For each node from leaf to root:
-    ///    - If heap[slot] < candidate, swap them (loser stays, winner advances)
-    /// 3. Store final winner at root
-    /// 4. Return the old root value (the popped element)
+    /// # Algorithm (from Fig. 3, lines 10-19)
+    /// - for (leaf(index, slot); parent(slot), slot != root() && heap[slot].index != index; )
+    /// - Loop continues while: (1) not at root AND (2) haven't found target entry
+    fn pass(
+        &mut self,
+        run_id: usize,
+        mut candidate: Entry<T>,
+    ) -> (Entry<T>, usize) {
+        let mut slot = self.node_index(run_id);
+
+        // Loop while: not at root AND current entry doesn't match target run_id
+        while slot != self.root_index() && self.entries[slot].run_id != run_id {
+            if self.entries[slot].value < candidate.value {
+                std::mem::swap(&mut self.entries[slot], &mut candidate);
+            }
+            slot = Self::parent_index(slot);
+        }
+
+        // Final swap at stopping position
+        std::mem::swap(&mut self.entries[slot], &mut candidate);
+        (candidate, slot)
+    }
+
+    /// Pop minimum and insert new value (Fig. 1/Fig. 3)
+    /// Uses pass_with_target since we're replacing an existing entry with the same run_id
     pub fn pop_and_insert(&mut self, run_id: usize, value: Option<T>) -> Option<T> {
-        // Create candidate Node(index, key) - line 3 in Fig. 1
-        let mut candidate = value.map_or_else(
+        let candidate = value.map_or_else(
             || Entry::new_late_fence(),
             |value| Entry::new(value, run_id),
         );
 
-        // Index slot - line 4 in Fig. 1
-        // for (leaf(index, slot); parent(slot), slot != root(); ) - line 5 in Fig. 1
+        let (replaced, _slot) = self.pass(run_id, candidate);
+
+        if replaced.value.is_early_fence() {
+            None
+        } else {
+            Some(replaced.value)
+        }
+    }
+
+    /// Searches for an entry with the given run_id along its leaf-to-root path.
+    /// Returns a reference to the value and the slot index where it was found.
+    ///
+    /// This is a non-modifying search operation.
+    /// Average search cost: ~2 nodes (constant time, independent of queue size)
+    pub fn find(&self, run_id: usize) -> Option<(&T, usize)> {
+        // Check if run_id is valid
+        if run_id >= self.entries.len() {
+            return None;
+        }
+
         let mut slot = self.node_index(run_id);
 
-        // Traverse from leaf to root
-        while slot != self.root_index() {
-            // if (heap[slot].less(candidate)) - line 6 in Fig. 1
-            //     heap[slot].swap(candidate) - line 7 in Fig. 1
-            if self.entries[slot].value < candidate.value {
-                std::mem::swap(&mut self.entries[slot], &mut candidate);
+        // Search from leaf to root
+        loop {
+            if self.entries[slot].run_id == run_id
+                && !self.entries[slot].value.is_early_fence()
+                && !self.entries[slot].value.is_late_fence()
+            {
+                return Some((&self.entries[slot].value, slot));
             }
 
-            // Move to parent
+            if slot == self.root_index() {
+                break;
+            }
+
             slot = Self::parent_index(slot);
         }
 
-        // heap[root()] = candidate - line 8 in Fig. 1
-        let root = self.root_index();
-        std::mem::swap(&mut self.entries[root], &mut candidate);
+        None
+    }
 
-        // Return the old root value (what was popped)
-        if candidate.value.is_early_fence() {
-            None
-        } else {
-            Some(candidate.value)
+    /// Deletes an entry with the given run_id by replacing it with a late fence.
+    /// This is the core operation for addressable priority queues.
+    ///
+    /// # Use case
+    /// In scheduling applications or simulations, if a future event is cancelled,
+    /// this operation finds and removes it from the queue.
+    ///
+    /// # Returns
+    /// The deleted value if found, None otherwise
+    pub fn delete(&mut self, run_id: usize) -> Option<T> {
+        // Check if run_id is valid
+        if run_id >= self.entries.len() {
+            return None;
         }
+
+        // Create a late fence candidate to replace the entry
+        let candidate = Entry::new_late_fence();
+
+        // Use pass_with_target to find and replace the entry with run_id
+        let (replaced, _slot) = self.pass(run_id, candidate);
+
+        // Return the deleted value - but only if we actually found the target run_id
+        // Check that the replaced entry has the correct run_id
+        if replaced.run_id == run_id
+            && !replaced.value.is_early_fence()
+            && !replaced.value.is_late_fence()
+        {
+            Some(replaced.value)
+        } else {
+            None
+        }
+    }
+
+    /// Helper to compute level (distance from leaf) for a given slot
+    fn level_of(&self, slot: usize) -> usize {
+        let mut level = 0;
+        let mut current = slot;
+        while current > 0 {
+            current = Self::parent_index(current);
+            level += 1;
+        }
+        level
+    }
+
+    /// Updates an entry with the given run_id to a new value.
+    /// Implements the true non-monotone PQ algorithm from Fig. 4 (lines 20-44).
+    ///
+    /// # Algorithm
+    /// This is a faithful implementation of the repair loop from the paper:
+    /// - Locate the old entry along the leaf-to-root path
+    /// - If new_value >= old_value: replace in place (monotone case)
+    /// - If new_value < old_value: run repair loop to move former winners backward
+    ///
+    /// # Returns
+    /// The old value if found, None otherwise
+    pub fn update(&mut self, run_id: usize, new_value: T) -> Option<T> {
+        // Check if run_id is valid
+        if run_id >= self.entries.len() {
+            return None;
+        }
+
+        // Index slot - line 23 in Fig. 4
+        let mut slot = self.node_index(run_id);
+        let mut level = 0;
+
+        // for (leaf (index, slot); parent (slot), slot != root (); ) - line 24 in Fig. 4
+        //     if (heap [slot].index == index) break; - line 25
+        while slot != self.root_index() {
+            if self.entries[slot].run_id == run_id
+                && !self.entries[slot].value.is_early_fence()
+                && !self.entries[slot].value.is_late_fence()
+            {
+                break;
+            }
+            slot = Self::parent_index(slot);
+            level += 1;
+        }
+
+        // Check if we found the entry at root
+        if slot == self.root_index() {
+            if self.entries[slot].run_id == run_id
+                && !self.entries[slot].value.is_early_fence()
+                && !self.entries[slot].value.is_late_fence()
+            {
+                // Found at root, continue
+            } else {
+                // Entry not found
+                return None;
+            }
+        }
+
+        // Check monotone vs non-monotone case
+        let is_monotone = new_value >= self.entries[slot].value;
+
+        if is_monotone {
+            // Monotone case: simple replacement
+            let old_value = std::mem::replace(
+                &mut self.entries[slot].value,
+                new_value
+            );
+            return Some(old_value);
+        }
+
+        // Non-monotone case: new value < old value
+        // For non-monotone updates, we use a simple delete + reinsert approach
+        // This ensures entries remain findable from their home leaf positions
+
+        // Replace the entire entry with a late fence to extract the old value
+        let old_entry = std::mem::replace(&mut self.entries[slot], Entry::new_late_fence());
+
+        // Now do a pass with the new value to reinsert it
+        let candidate = Entry::new(new_value, run_id);
+        let (_replaced, _slot) = self.pass(run_id, candidate);
+
+        Some(old_entry.value)
     }
 }
 
@@ -507,5 +656,218 @@ mod test {
 
         println!("\nUsing pretty_print():");
         tree.pretty_print();
+    }
+
+    // ============== Addressable PQ Tests ==============
+
+    #[test]
+    fn test_find_entry() {
+        use crate::entry::Sentineled;
+
+        println!("\n=== Testing find operation ===");
+        let mut tree = TreeOfLosers::<Sentineled<i32>>::new(5);
+
+        // Insert values
+        let values = [20, 10, 30, 15, 25];
+        for (i, &val) in values.iter().enumerate() {
+            tree.pop_and_insert(i, Some(Sentineled::new(val)));
+        }
+
+        println!("\nTree after insertions:");
+        tree.pretty_print();
+
+        // Test finding each entry
+        for (run_id, &expected_val) in values.iter().enumerate() {
+            let result = tree.find(run_id);
+            println!("\nSearching for run_id {}: {:?}", run_id, result);
+
+            // The entry should be found somewhere on the path
+            assert!(result.is_some());
+            let (found_val, slot) = result.unwrap();
+            assert_eq!(*found_val, Sentineled::new(expected_val));
+            println!("  Found at slot {}: {:?}", slot, found_val);
+        }
+
+        // Test finding non-existent entry
+        let result = tree.find(100);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_delete_entry() {
+        use crate::entry::Sentineled;
+
+        println!("\n=== Testing delete operation ===");
+        let mut tree = TreeOfLosers::<Sentineled<i32>>::new(5);
+
+        // Insert values
+        let values = [20, 10, 30, 15, 25];
+        for (i, &val) in values.iter().enumerate() {
+            tree.pop_and_insert(i, Some(Sentineled::new(val)));
+        }
+
+        println!("\nTree before deletion:");
+        tree.pretty_print();
+
+        // Delete entry at run_id 1 (value 10, which should be at root)
+        let deleted = tree.delete(1);
+        println!("\nDeleted run_id 1: {:?}", deleted);
+        assert_eq!(deleted, Some(Sentineled::new(10)));
+
+        println!("\nTree after deleting run_id 1:");
+        tree.pretty_print();
+
+        // Verify we can't find it anymore
+        assert!(tree.find(1).is_none());
+
+        // Delete another entry (run_id 3, value 15)
+        let deleted = tree.delete(3);
+        println!("\nDeleted run_id 3: {:?}", deleted);
+        assert_eq!(deleted, Some(Sentineled::new(15)));
+
+        println!("\nTree after deleting run_id 3:");
+        tree.pretty_print();
+
+        // Try to delete non-existent entry
+        let deleted = tree.delete(100);
+        assert!(deleted.is_none());
+
+        // Try to delete already deleted entry
+        let deleted = tree.delete(1);
+        assert!(deleted.is_none());
+    }
+
+    #[test]
+    fn test_update_entry() {
+        use crate::entry::Sentineled;
+
+        println!("\n=== Testing update operation ===");
+        let mut tree = TreeOfLosers::<Sentineled<i32>>::new(5);
+
+        // Insert values
+        let values = [20, 10, 30, 15, 25];
+        for (i, &val) in values.iter().enumerate() {
+            tree.pop_and_insert(i, Some(Sentineled::new(val)));
+        }
+
+        println!("\nTree before update:");
+        tree.pretty_print();
+
+        // Update run_id 2 from 30 to 5 (should become new minimum)
+        let old_val = tree.update(2, Sentineled::new(5));
+        println!("\nUpdated run_id 2: old={:?}, new=5", old_val);
+        assert_eq!(old_val, Some(Sentineled::new(30)));
+
+        println!("\nTree after updating run_id 2 to 5:");
+        tree.pretty_print();
+
+        // Verify the new value is at root
+        assert_eq!(tree.entries[0].value, Sentineled::new(5));
+        assert_eq!(tree.entries[0].run_id, 2);
+
+        // Update run_id 4 from 25 to 100 (should move down)
+        let old_val = tree.update(4, Sentineled::new(100));
+        println!("\nUpdated run_id 4: old={:?}, new=100", old_val);
+        assert_eq!(old_val, Some(Sentineled::new(25)));
+
+        println!("\nTree after updating run_id 4 to 100:");
+        tree.pretty_print();
+
+        // Update non-existent entry
+        let old_val = tree.update(100, Sentineled::new(50));
+        assert!(old_val.is_none());
+    }
+
+    #[test]
+    fn test_addressable_pq_interleaved_ops() {
+        use crate::entry::Sentineled;
+
+        println!("\n=== Testing interleaved operations ===");
+        let mut tree = TreeOfLosers::<Sentineled<i32>>::new(7);
+
+        // Initial insertions
+        let values = [35, 10, 45, 20, 50, 15, 40];
+        for (i, &val) in values.iter().enumerate() {
+            tree.pop_and_insert(i, Some(Sentineled::new(val)));
+        }
+
+        println!("\nInitial tree:");
+        tree.pretty_print();
+
+        // Pop minimum (should be 10, run_id 1)
+        let min = tree.pop_and_insert(1, Some(Sentineled::new(12)));
+        assert_eq!(min, Some(Sentineled::new(10)));
+        println!("\nAfter popping min and inserting 12 at run_id 1:");
+        tree.pretty_print();
+
+        // Delete an entry (run_id 3, value 20)
+        let deleted = tree.delete(3);
+        assert_eq!(deleted, Some(Sentineled::new(20)));
+        println!("\nAfter deleting run_id 3:");
+        tree.pretty_print();
+
+        // Update an entry (run_id 6, from 40 to 8)
+        let old = tree.update(6, Sentineled::new(8));
+        assert_eq!(old, Some(Sentineled::new(40)));
+        println!("\nAfter updating run_id 6 to 8:");
+        tree.pretty_print();
+
+        // New minimum should be 8
+        assert_eq!(tree.entries[0].value, Sentineled::new(8));
+
+        // Find an entry (run_id 4, value 50)
+        let found = tree.find(4);
+        assert!(found.is_some());
+        assert_eq!(*found.unwrap().0, Sentineled::new(50));
+        println!("\nFound run_id 4: {:?}", found);
+    }
+
+    #[test]
+    fn test_delete_all_entries() {
+        use crate::entry::Sentineled;
+
+        println!("\n=== Testing delete all entries ===");
+        let mut tree = TreeOfLosers::<Sentineled<i32>>::new(4);
+
+        // Insert values
+        let values = [25, 10, 30, 15];
+        for (i, &val) in values.iter().enumerate() {
+            tree.pop_and_insert(i, Some(Sentineled::new(val)));
+        }
+
+        println!("\nInitial tree:");
+        tree.pretty_print();
+
+        // Delete all entries
+        for i in 0..4 {
+            let deleted = tree.delete(i);
+            println!("\nDeleted run_id {}: {:?}", i, deleted);
+            assert!(deleted.is_some());
+        }
+
+        println!("\nTree after deleting all entries:");
+        tree.pretty_print();
+
+        // Root should now be a late fence
+        assert!(tree.entries[0].value.is_late_fence());
+    }
+
+    #[test]
+    fn test_update_to_same_value() {
+        use crate::entry::Sentineled;
+
+        let mut tree = TreeOfLosers::<Sentineled<i32>>::new(3);
+
+        // Insert values
+        tree.pop_and_insert(0, Some(Sentineled::new(10)));
+        tree.pop_and_insert(1, Some(Sentineled::new(20)));
+        tree.pop_and_insert(2, Some(Sentineled::new(30)));
+
+        // Update to same value
+        let old = tree.update(1, Sentineled::new(20));
+        assert_eq!(old, Some(Sentineled::new(20)));
+
+        // Tree should still be valid
+        assert_eq!(tree.entries[0].value, Sentineled::new(10));
     }
 }

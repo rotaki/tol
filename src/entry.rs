@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 
+#[derive(Clone)]
 pub(crate) struct Entry<T: Ord + SentinelValue> {
     pub(crate) value: T,
     pub(crate) run_id: usize,
