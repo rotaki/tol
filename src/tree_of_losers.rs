@@ -1,112 +1,214 @@
-use crate::entry::{Entry, SentinelValue, Sentineled};
-use std::cmp::Ord;
+use std::mem;
 
-fn prev_power_of_two(num: usize) -> usize {
-    let mut size = 1;
-    while size <= num {
-        size *= 2;
-    }
-    size / 2
+use crate::offset_value_coding::SentinelValue;
+
+pub struct LoserTree<T> {
+    // The tree nodes.
+    // Index 0: Stores the overall Winner.
+    // Indices 1..size: Store the Losers of the tournament matches.
+    nodes: Vec<Node<T>>,
+
+    // The number of sources (k).
+    // The conceptual leaves are located at indices [capacity .. 2*capacity].
+    capacity: usize,
 }
 
-pub struct TreeOfLosers<T: Ord + SentinelValue> {
-    curr: usize,
-    input_leaf_start: usize,
-    entries: Vec<Entry<T>>,
+/// A node in the Loser Tree.
+#[derive(Clone, Debug)]
+struct Node<T> {
+    key: T,       // The value of the LOSER at this node
+    index: usize, // The run ID of the LOSER
 }
 
-impl<T: Ord + SentinelValue> TreeOfLosers<T> {
-    /// Creates a new TreeOfLosers structure for k-way merging
-    ///
-    /// # Arguments
-    /// * `num_runs` - The number of input runs (sequences) to merge
-    ///
-    /// # Algorithm
-    /// The tree is constructed as a tournament tree where internal nodes store losers
-    /// and the root contains the overall winner. The tree structure is designed to handle
-    /// any number of runs by creating a balanced tree with additional nodes as needed.
-    pub fn new(num_runs: usize) -> Self {
-        assert!(num_runs > 0);
+impl<T> Node<T> {
+    pub fn new(key: T, index: usize) -> Self {
+        Node { key, index }
+    }
+}
 
-        // Calculate the number of leaf nodes needed in the tree.
-        // Each pair of runs shares a leaf node, so we need ceil(num_runs/2) leaves.
-        let input_leaf_nodes = num_runs.div_ceil(2);
-        assert!(input_leaf_nodes > 0);
-
-        // Find the largest power of 2 that is smaller or equal to the number of leaf nodes.
-        // This forms the base of our nearly-complete binary tree structure.
-        //
-        // Example 1: If num_runs=5, then input_leaf_nodes=3 (ceil(5/2))
-        //           base_leaf_nodes=2 (largest power of 2 ≤ 3)
-        //
-        // Initial tree (before inserting any runs):
-        // ================= Tree of Losers (Pretty) =================
-        // Root (Winner): EF
-        //
-        // └── [EF]
-        //     ├── [EF] <-- runs (0, 1)
-        //     └── [EF]
-        //         ├── [LF] <-- run 4
-        //         └── [EF] <-- runs (2, 3)
-        //
-        // After inserting values [20, 10, 30, 15, 25]:
-        // ================= Tree of Losers (Pretty) =================
-        // Root (Winner): (10, 1)
-        //
-        // └── [R3:15]
-        //     ├── [R0:20] <-- runs (0, 1)
-        //     └── [R4:25]
-        //         ├── [LF] <-- run 4
-        //         └── [R2:30] <-- runs (2, 3)
-
-        // Base leaf nodes refer to the number of leaf nodes in the largest complete
-        // binary subtree contained within our tree.
-        let base_leaf_nodes = prev_power_of_two(input_leaf_nodes);
-
-        // Calculate total number of nodes in the tree.
-        // Formula: 2 * base_leaf_nodes + (input_leaf_nodes - base_leaf_nodes) * 2
-        //
-        // This creates a tree where:
-        // - 2 * base_leaf_nodes form a complete binary tree
-        // - Remaining 2 * (input_leaf_nodes - base_leaf_nodes) are additional nodes
-        //
-        // For num_runs=5 example:
-        // - base_leaf_nodes = 2
-        // - input_leaf_nodes = 3
-        // - num_nodes = 2*2 + (3-2)*2 = 4 + 2 = 6
-        let num_nodes = 2 * base_leaf_nodes + (input_leaf_nodes - base_leaf_nodes) * 2;
-        let mut entries = Vec::with_capacity(num_nodes);
-
-        // Fill the tree with late fence values
-        for _ in 0..num_runs {
-            entries.push(Entry::new_early_fence());
+impl<T: Ord + SentinelValue> LoserTree<T> {
+    pub fn new(values: Vec<T>) -> Self {
+        let size = values.len();
+        if size == 0 {
+            return Self {
+                nodes: vec![],
+                capacity: 0,
+            };
         }
 
-        for _ in num_runs..num_nodes {
-            entries.push(Entry::new_late_fence());
+        let capacity = size.next_power_of_two();
+        let mut nodes = Vec::with_capacity(capacity);
+
+        // Initialize internal nodes (1..capacity) with Early Fence sentinels.
+        // Index 0 is also initialized but will be overwritten at the end.
+        for _ in 0..capacity {
+            nodes.push(Node {
+                key: T::early_fence(),
+                index: usize::MAX,
+            });
         }
 
-        Self {
-            input_leaf_start: num_nodes - input_leaf_nodes,
-            curr: 0,
-            entries,
+        let mut lt = LoserTree { nodes, capacity };
+
+        // 1. Process Real Values
+        for (i, val) in values.into_iter().enumerate() {
+            lt.pass(i, val);
         }
+
+        // 2. Process Padding (Late Fence)
+        for i in size..capacity {
+            lt.pass(i, T::late_fence());
+        }
+
+        lt
     }
 
-    pub fn top_run_id(&mut self) -> Option<usize> {
-        if self.entries[0].value.is_late_fence() {
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn peek(&self) -> Option<(&T, usize)> {
+        if self.nodes.is_empty() {
+            return None;
+        }
+        if self.nodes[0].key.is_late_fence() {
+            return None;
+        }
+        debug_assert!(!self.nodes[0].key.is_early_fence());
+        return Some((&self.nodes[0].key, self.nodes[0].index));
+    }
+
+    /// Replaces the current winner with `new_val`, replays the tournament,
+    /// and returns the OLD winner value (ownership transferred).
+    pub fn push(&mut self, new_val: T) -> T {
+        if self.nodes.is_empty() {
+            panic!("Cannot push to an empty LoserTree");
+        }
+
+        let source_idx = self.nodes[0].index;
+        let old_node = self.pass(source_idx, new_val);
+        return old_node.key;
+    }
+
+    /// Updates the value associated with `source_idx` to `new_val`.
+    /// This supports both increasing and decreasing the key.
+    /// Returns the old value that was previously stored for `source_idx`.
+    pub fn update(&mut self, source_idx: usize, new_val: T) -> T {
+        if self.nodes.is_empty() {
+            panic!("Cannot update empty tree");
+        }
+        let old_node = self.pass(source_idx, new_val);
+        old_node.key
+    }
+
+    /// Marks current winner as exhausted and returns the value that was just exhausted.
+    pub fn mark_current_exhausted(&mut self) -> Option<T> {
+        if self.nodes.is_empty() {
+            return None;
+        }
+
+        let source_idx = self.nodes[0].index;
+        let old_node = self.pass(source_idx, T::late_fence());
+
+        if old_node.key.is_late_fence() {
             None
-        } else if self.entries[0].value.is_early_fence() {
-            let curr = self.curr;
-            self.curr += 1;
-            Some(curr)
         } else {
-            Some(self.entries[0].run_id)
+            Some(old_node.key)
         }
     }
 
-    pub fn node_index(&self, run_id: usize) -> usize {
-        self.input_leaf_start + run_id / 2
+    /// Swaps the node at index `i` with the node at index `j`.
+    ///
+    /// # Safety
+    /// Caller must ensure `i` and `j` are valid indices and `i != j`.
+    #[inline(always)]
+    fn swap_node(&mut self, i: usize, j: usize) {
+        debug_assert!(i < self.nodes.len());
+        debug_assert!(j < self.nodes.len());
+        debug_assert!(i != j);
+
+        unsafe {
+            let ptr_i: *mut Node<T> = self.nodes.get_unchecked_mut(i);
+            let ptr_j: *mut Node<T> = self.nodes.get_unchecked_mut(j);
+            mem::swap(&mut (*ptr_i), &mut (*ptr_j));
+        }
+    }
+
+    /// Core logic: Replay the tournament path from `index` up to the root.
+    ///
+    /// Supports arbitrary updates (decrease-key) via Phase 2 bubble-up.
+    /// Uses efficient geometric check (bit shifting) to identify Former Winners.
+    fn pass(&mut self, index: usize, key: T) -> Node<T> {
+        let mut candidate = Node::new(key, index);
+        let mut slot = Self::parent_index(self.leaf_index(index));
+        // Tracks the height (level) of `slot`. Leaf is level 0. Parent is level 1.
+        let mut level = 1;
+
+        // --- PHASE 1: Standard Loser Tree Climb ---
+        // Bubbles up from leaf. Standard "Play Match" logic.
+        while slot != self.root_index() && self.nodes[slot].index != index {
+            if candidate.key > self.nodes[slot].key {
+                mem::swap(&mut candidate, &mut self.nodes[slot]);
+            }
+            slot = Self::parent_index(slot);
+            level += 1;
+        }
+
+        // --- PHASE 2: Handle Updates / Final Placement ---
+        let mut dest = slot;
+        let mut dest_level = level; // Level of `dest`
+
+        // Update Case: We found our own run ID in the tree.
+        if candidate.index == index {
+            while slot != self.root_index() {
+                // Find the ancestor that holds the opponent (the former winner).
+                // The former winner is the value in the ancestors that originates
+                // from the subtree rooted at `dest` (which is at `dest_level`).
+                loop {
+                    slot = Self::parent_index(slot);
+                    level += 1;
+
+                    if slot == self.root_index() {
+                        break;
+                    }
+
+                    // Geometric Property: If `opp_leaf` is a descendant of `dest`,
+                    // shifting it up by `dest_level` must equal `dest`.
+                    let opp_idx = self.nodes[slot].index;
+                    if opp_idx != usize::MAX {
+                        let opp_leaf = self.leaf_index(opp_idx);
+                        if (opp_leaf >> dest_level) == dest {
+                            break;
+                        }
+                    }
+                }
+
+                // If candidate is worse, we stop bubbling.
+                if candidate.key > self.nodes[slot].key {
+                    break;
+                }
+
+                // WE WIN
+                // Swap content:
+                // dest gets the Opponent (Old Winner -> New Loser).
+                // slot gets the Candidate (New Winner -> Moving Up).
+                self.swap_node(dest, slot);
+
+                // Move our "active" position up to `slot`.
+                dest = slot;
+                dest_level = level;
+            }
+        }
+
+        // Final Placement: Put the candidate into `dest`
+        mem::swap(&mut self.nodes[dest], &mut candidate);
+        candidate
+    }
+
+    // --- Navigation Helpers ---
+
+    pub fn leaf_index(&self, run_id: usize) -> usize {
+        self.capacity + run_id
     }
 
     pub fn root_index(&self) -> usize {
@@ -114,760 +216,612 @@ impl<T: Ord + SentinelValue> TreeOfLosers<T> {
     }
 
     pub fn parent_index(index: usize) -> usize {
-        // [0 is root] [1] [2, 3] [4,5,6,7] ...
         index / 2
     }
 
-    /// Leaf-to-root pass with early termination (Fig. 3)
-    /// This is the core of the addressable priority queue.
-    /// Stops early when finding the target entry.
-    ///
-    /// # Algorithm (from Fig. 3, lines 10-19)
-    /// - for (leaf(index, slot); parent(slot), slot != root() && heap[slot].index != index; )
-    /// - Loop continues while: (1) not at root AND (2) haven't found target entry
-    fn pass(
-        &mut self,
-        run_id: usize,
-        mut candidate: Entry<T>,
-    ) -> (Entry<T>, usize) {
-        let mut slot = self.node_index(run_id);
-
-        // Loop while: not at root AND current entry doesn't match target run_id
-        while slot != self.root_index() && self.entries[slot].run_id != run_id {
-            if self.entries[slot].value < candidate.value {
-                std::mem::swap(&mut self.entries[slot], &mut candidate);
-            }
-            slot = Self::parent_index(slot);
-        }
-
-        // Final swap at stopping position
-        std::mem::swap(&mut self.entries[slot], &mut candidate);
-        (candidate, slot)
+    #[cfg(test)]
+    pub fn get_keys(&self) -> Vec<&T> {
+        self.nodes.iter().map(|node| &node.key).collect()
     }
 
-    /// Pop minimum and insert new value (Fig. 1/Fig. 3)
-    /// Uses pass_with_target since we're replacing an existing entry with the same run_id
-    pub fn pop_and_insert(&mut self, run_id: usize, value: Option<T>) -> Option<T> {
-        let candidate = value.map_or_else(
-            || Entry::new_late_fence(),
-            |value| Entry::new(value, run_id),
-        );
-
-        let (replaced, _slot) = self.pass(run_id, candidate);
-
-        if replaced.value.is_early_fence() {
-            None
-        } else {
-            Some(replaced.value)
-        }
-    }
-
-    /// Searches for an entry with the given run_id along its leaf-to-root path.
-    /// Returns a reference to the value and the slot index where it was found.
-    ///
-    /// This is a non-modifying search operation.
-    /// Average search cost: ~2 nodes (constant time, independent of queue size)
-    pub fn find(&self, run_id: usize) -> Option<(&T, usize)> {
-        // Check if run_id is valid
-        if run_id >= self.entries.len() {
-            return None;
-        }
-
-        let mut slot = self.node_index(run_id);
-
-        // Search from leaf to root
-        loop {
-            if self.entries[slot].run_id == run_id
-                && !self.entries[slot].value.is_early_fence()
-                && !self.entries[slot].value.is_late_fence()
-            {
-                return Some((&self.entries[slot].value, slot));
-            }
-
-            if slot == self.root_index() {
-                break;
-            }
-
-            slot = Self::parent_index(slot);
-        }
-
-        None
-    }
-
-    /// Deletes an entry with the given run_id by replacing it with a late fence.
-    /// This is the core operation for addressable priority queues.
-    ///
-    /// # Use case
-    /// In scheduling applications or simulations, if a future event is cancelled,
-    /// this operation finds and removes it from the queue.
-    ///
-    /// # Returns
-    /// The deleted value if found, None otherwise
-    pub fn delete(&mut self, run_id: usize) -> Option<T> {
-        // Check if run_id is valid
-        if run_id >= self.entries.len() {
-            return None;
-        }
-
-        // Create a late fence candidate to replace the entry
-        let candidate = Entry::new_late_fence();
-
-        // Use pass_with_target to find and replace the entry with run_id
-        let (replaced, _slot) = self.pass(run_id, candidate);
-
-        // Return the deleted value - but only if we actually found the target run_id
-        // Check that the replaced entry has the correct run_id
-        if replaced.run_id == run_id
-            && !replaced.value.is_early_fence()
-            && !replaced.value.is_late_fence()
-        {
-            Some(replaced.value)
-        } else {
-            None
-        }
-    }
-
-    /// Helper to compute level (distance from leaf) for a given slot
-    fn level_of(&self, slot: usize) -> usize {
-        let mut level = 0;
-        let mut current = slot;
-        while current > 0 {
-            current = Self::parent_index(current);
-            level += 1;
-        }
-        level
-    }
-
-    /// Updates an entry with the given run_id to a new value.
-    /// Implements the true non-monotone PQ algorithm from Fig. 4 (lines 20-44).
-    ///
-    /// # Algorithm
-    /// This is a faithful implementation of the repair loop from the paper:
-    /// - Locate the old entry along the leaf-to-root path
-    /// - If new_value >= old_value: replace in place (monotone case)
-    /// - If new_value < old_value: run repair loop to move former winners backward
-    ///
-    /// # Returns
-    /// The old value if found, None otherwise
-    pub fn update(&mut self, run_id: usize, new_value: T) -> Option<T> {
-        // Check if run_id is valid
-        if run_id >= self.entries.len() {
-            return None;
-        }
-
-        // Index slot - line 23 in Fig. 4
-        let mut slot = self.node_index(run_id);
-        let mut level = 0;
-
-        // for (leaf (index, slot); parent (slot), slot != root (); ) - line 24 in Fig. 4
-        //     if (heap [slot].index == index) break; - line 25
-        while slot != self.root_index() {
-            if self.entries[slot].run_id == run_id
-                && !self.entries[slot].value.is_early_fence()
-                && !self.entries[slot].value.is_late_fence()
-            {
-                break;
-            }
-            slot = Self::parent_index(slot);
-            level += 1;
-        }
-
-        // Check if we found the entry at root
-        if slot == self.root_index() {
-            if self.entries[slot].run_id == run_id
-                && !self.entries[slot].value.is_early_fence()
-                && !self.entries[slot].value.is_late_fence()
-            {
-                // Found at root, continue
-            } else {
-                // Entry not found
-                return None;
-            }
-        }
-
-        // Check monotone vs non-monotone case
-        let is_monotone = new_value >= self.entries[slot].value;
-
-        if is_monotone {
-            // Monotone case: simple replacement
-            let old_value = std::mem::replace(
-                &mut self.entries[slot].value,
-                new_value
-            );
-            return Some(old_value);
-        }
-
-        // Non-monotone case: new value < old value
-        // For non-monotone updates, we use a simple delete + reinsert approach
-        // This ensures entries remain findable from their home leaf positions
-
-        // Replace the entire entry with a late fence to extract the old value
-        let old_entry = std::mem::replace(&mut self.entries[slot], Entry::new_late_fence());
-
-        // Now do a pass with the new value to reinsert it
-        let candidate = Entry::new(new_value, run_id);
-        let (_replaced, _slot) = self.pass(run_id, candidate);
-
-        Some(old_entry.value)
-    }
-}
-
-impl<T: Ord + SentinelValue + std::fmt::Debug> TreeOfLosers<T> {
-    pub fn print(&self) {
-        if self.entries.is_empty() {
-            return;
-        }
-        println!("================= Tree of losers =================");
-        println!("{:?} ", self.entries[0]);
-        let mut index = 1;
-        let mut level = 0;
-        while index < self.entries.len() {
-            for _ in 0..(1 << level) {
-                if index >= self.entries.len() {
-                    break;
-                }
-                print!("{:?} ", self.entries[index]);
-                index += 1;
-            }
-            println!();
-            level += 1;
-        }
-    }
-
-    /// Pretty prints the tree structure with visual indentation and tree branches
-    pub fn pretty_print(&self) {
-        if self.entries.is_empty() {
-            println!("Empty tree");
-            return;
-        }
-
-        println!("================= Tree of Losers (Pretty) =================");
-        println!("Root (Winner): {:?}", self.entries[0]);
-        println!();
-
-        // Calculate which runs map to which leaf nodes
-        let num_runs = self
-            .entries
-            .iter()
-            .filter(|e| !e.value.is_late_fence())
-            .count();
-
-        // Helper function to format entry with run mapping info
-        let format_entry = |index: usize, entry: &Entry<T>| -> String {
-            let base_str = if entry.value.is_early_fence() {
-                "[EF]".to_string()
-            } else if entry.value.is_late_fence() {
-                "[LF]".to_string()
-            } else {
-                format!("[R{}:{:?}]", entry.run_id, entry.value)
-            };
-
-            // Add run mapping for leaf nodes
-            if self.is_leaf_node(index) {
-                let run_ids = self.get_runs_for_leaf(index, num_runs);
-                if !run_ids.is_empty() {
-                    let runs_str = if run_ids.len() == 1 {
-                        format!("run {}", run_ids[0])
-                    } else {
-                        format!("runs ({}, {})", run_ids[0], run_ids[1])
-                    };
-                    format!("{} <-- {}", base_str, runs_str)
-                } else {
-                    base_str
-                }
-            } else {
-                base_str
-            }
-        };
-
-        // Print tree using recursive approach
-        self.print_subtree(1, "", true, &format_entry);
-    }
-
-    /// Check if a node index represents a leaf node
-    fn is_leaf_node(&self, index: usize) -> bool {
-        let left_child = index * 2;
-        left_child >= self.entries.len()
-    }
-
-    /// Get the run IDs that map to a specific leaf node
-    fn get_runs_for_leaf(&self, leaf_index: usize, num_runs: usize) -> Vec<usize> {
-        let mut runs = Vec::new();
-
-        // Reverse the node_index calculation to find which runs map here
-        //     node_index = input_leaf_start + run_id / 2
-        //     run_id / 2 = node_index - input_leaf_start
-        let offset = leaf_index as isize - self.input_leaf_start as isize;
-
-        if offset >= 0 {
-            let offset = offset as usize;
-            // Each leaf position can handle 2 runs
-            let base_run = offset * 2;
-            if base_run < num_runs {
-                runs.push(base_run);
-            }
-            if base_run + 1 < num_runs {
-                runs.push(base_run + 1);
-            }
-        }
-
-        runs
-    }
-
-    /// Helper method to recursively print subtree
-    fn print_subtree<F>(&self, index: usize, prefix: &str, is_last: bool, format_fn: &F)
+    /// Visualizes the tree structure in a human-readable format.
+    /// Shows the tree layout with node indices, values, and source indices.
+    pub fn visualize(&self) -> String
     where
-        F: Fn(usize, &Entry<T>) -> String,
+        T: std::fmt::Display,
     {
-        if index >= self.entries.len() {
-            return;
+        if self.nodes.is_empty() {
+            return "Empty Tree".to_string();
         }
 
-        // Print current node
-        let connector = if is_last { "└── " } else { "├── " };
-        println!(
-            "{}{}{}",
-            prefix,
-            connector,
-            format_fn(index, &self.entries[index])
-        );
+        let mut output = String::new();
+        output.push_str(&format!(
+            "=== Loser Tree (capacity={}) ===\n\n",
+            self.capacity
+        ));
 
-        // Prepare prefix for children
-        let child_prefix = format!("{}{}", prefix, if is_last { "    " } else { "│   " });
+        // Show the winner (root node at index 0)
+        output.push_str(&format!(
+            "Winner [0]: value={}, source={}\n\n",
+            self.nodes[0].key, self.nodes[0].index
+        ));
 
-        // Print children (right child first)
-        let left_child = index * 2;
-        let right_child = index * 2 + 1;
+        // Calculate tree height
+        let height = (self.capacity as f64).log2().ceil() as usize;
 
-        if right_child < self.entries.len() {
-            self.print_subtree(
-                right_child,
-                &child_prefix,
-                left_child >= self.entries.len(),
-                format_fn,
-            );
+        // Display internal nodes level by level
+        for level in 0..height {
+            let start_idx = 1 << level; // 2^level
+            let end_idx = (1 << (level + 1)).min(self.capacity);
+
+            output.push_str(&format!("Level {} (Internal Nodes):\n", level));
+
+            for idx in start_idx..end_idx {
+                if idx < self.nodes.len() {
+                    let node = &self.nodes[idx];
+                    let value_str = if node.index == usize::MAX {
+                        format!("{} (sentinel)", node.key)
+                    } else {
+                        format!("{}", node.key)
+                    };
+
+                    output.push_str(&format!(
+                        "  [{}]: value={}, source={}\n",
+                        idx, value_str, node.index
+                    ));
+                }
+            }
+            output.push('\n');
         }
 
-        if left_child < self.entries.len() {
-            self.print_subtree(left_child, &child_prefix, true, format_fn);
+        // Show conceptual leaves
+        output.push_str("Conceptual Leaves (not stored):\n");
+        output.push_str(&format!(
+            "  Indices {}-{} map to sources 0-{}\n",
+            self.capacity,
+            2 * self.capacity - 1,
+            self.capacity - 1
+        ));
+
+        output
+    }
+
+    /// Returns a compact single-line representation of the tree.
+    /// Format: [winner] | [node1] [node2] ...
+    pub fn compact_view(&self) -> String
+    where
+        T: std::fmt::Display,
+    {
+        if self.nodes.is_empty() {
+            return "[]".to_string();
         }
+
+        let mut parts = Vec::new();
+
+        // Winner
+        parts.push(format!(
+            "[W:{}(s{})]",
+            self.nodes[0].key, self.nodes[0].index
+        ));
+
+        // Internal nodes
+        for (idx, node) in self.nodes.iter().enumerate().skip(1) {
+            let display = if node.index == usize::MAX {
+                format!("[{}:-]", idx)
+            } else {
+                format!("[{}:{}(s{})]", idx, node.key, node.index)
+            };
+            parts.push(display);
+        }
+
+        parts.join(" ")
+    }
+
+    /// Prints the tree structure as an ASCII tree diagram.
+    /// This provides a visual hierarchical view of the tournament.
+    pub fn ascii_tree(&self) -> String
+    where
+        T: std::fmt::Display,
+    {
+        if self.nodes.is_empty() {
+            return "Empty Tree".to_string();
+        }
+
+        let mut output = String::new();
+        output.push_str("=== Tournament Tree Structure ===\n\n");
+
+        // Helper function to build tree recursively
+        fn build_node<T: std::fmt::Display>(
+            nodes: &[Node<T>],
+            idx: usize,
+            capacity: usize,
+            prefix: String,
+            is_last: bool,
+        ) -> String {
+            let mut result = String::new();
+
+            // Current node display
+            let connector = if is_last { "└── " } else { "├── " };
+
+            if idx == 0 {
+                result.push_str(&format!(
+                    "WINNER: {} (source {})\n",
+                    nodes[idx].key, nodes[idx].index
+                ));
+            } else if idx < nodes.len() {
+                let node = &nodes[idx];
+                let value_str = if node.index == usize::MAX {
+                    format!("{} (sentinel)", node.key)
+                } else {
+                    format!("{}", node.key)
+                };
+                result.push_str(&format!(
+                    "{}{}<{}> LOSER: {} (source {})\n",
+                    prefix, connector, idx, value_str, node.index
+                ));
+            } else if idx >= capacity {
+                // Conceptual leaf
+                let source = idx - capacity;
+                result.push_str(&format!(
+                    "{}{}[Leaf {}] source {}\n",
+                    prefix, connector, idx, source
+                ));
+                return result;
+            } else {
+                // Node is out of bounds but not a leaf, shouldn't happen
+                return result;
+            }
+
+            // Recurse to children (only for internal nodes below capacity)
+            // Note: For node 0, we need to start from node 1, not node 0
+            if idx < capacity {
+                let left_child = if idx == 0 { 1 } else { 2 * idx };
+                let right_child = if idx == 0 { 1 } else { 2 * idx + 1 };
+
+                // For root node (idx 0), only traverse once from node 1
+                if idx == 0 {
+                    result.push_str(&build_node(nodes, 1, capacity, String::new(), true));
+                    return result;
+                }
+
+                // Only recurse if children indices are valid
+                if left_child >= 2 * capacity && right_child >= 2 * capacity {
+                    // Both children would be beyond the tree bounds
+                    return result;
+                }
+
+                let child_prefix = format!("{}{}   ", prefix, if is_last { " " } else { "│" });
+
+                if right_child < 2 * capacity {
+                    result.push_str(&build_node(
+                        nodes,
+                        right_child,
+                        capacity,
+                        child_prefix.clone(),
+                        false,
+                    ));
+                }
+                if left_child < 2 * capacity {
+                    result.push_str(&build_node(nodes, left_child, capacity, child_prefix, true));
+                }
+            }
+
+            result
+        }
+
+        output.push_str(&build_node(
+            &self.nodes,
+            0,
+            self.capacity,
+            String::new(),
+            true,
+        ));
+        output
     }
 }
 
-pub fn merge_with_tree_of_losers_with_sentinel<T: SentinelValue + Ord>(
-    mut runs: Vec<Box<impl Iterator<Item = T>>>,
-) -> Vec<T> {
-    // Create a tree of losers.
-    let mut tree = TreeOfLosers::<T>::new(runs.len());
-
-    // Output
-    let mut output = Vec::new();
-
-    // Fill the tree with the first entry of each run.
-    // If the top entry is a late fence, it will return None.
-    while let Some(run_id) = tree.top_run_id() {
-        // Pop the top entry and insert the next entry from the run.
-        // It the top entry is a early fence, it will return None.
-        if let Some(val) = tree.pop_and_insert(run_id, runs[run_id].next()) {
-            output.push(val);
-        }
-    }
-
-    output
-}
-
-pub fn merge_with_tree_of_losers_no_sentinel<T: Ord>(
-    mut runs: Vec<Box<impl Iterator<Item = T>>>,
-) -> Vec<T> {
-    // Create a tree of losers.
-    let mut tree = TreeOfLosers::<Sentineled<T>>::new(runs.len());
-
-    // Output
-    let mut output = Vec::new();
-
-    // Fill the tree with the first entry of each run.
-    // If the top entry is a late fence, it will return None.
-    while let Some(run_id) = tree.top_run_id() {
-        // Pop the top entry and insert the next entry from the run.
-        // It the top entry is a early fence, it will return None.
-        if let Some(val) = tree.pop_and_insert(run_id, runs[run_id].next().map(Sentineled::new)) {
-            output.push(val.inner());
-        }
-    }
-
-    output
-}
-
-pub fn sort_with_tree_of_losers_with_sentinel<T: SentinelValue + Ord>(mut run: Vec<T>) -> Vec<T> {
-    let num_runs = run.len();
-    let mut tree = TreeOfLosers::<T>::new(num_runs);
-
-    // Output
-    let mut output = Vec::new();
-
-    while let Some(run_id) = tree.top_run_id() {
-        if let Some(val) = tree.pop_and_insert(run_id, run.pop()) {
-            output.push(val);
-        }
-    }
-
-    output
-}
-
-pub fn sort_with_tree_of_losers_no_sentinel<T: Ord>(mut run: Vec<T>) -> Vec<T> {
-    let num_runs = run.len();
-    let mut tree = TreeOfLosers::<Sentineled<T>>::new(num_runs);
-
-    // Output
-    let mut output = Vec::with_capacity(num_runs);
-
-    while let Some(run_id) = tree.top_run_id() {
-        if let Some(val) = tree.pop_and_insert(run_id, run.pop().map(Sentineled::new)) {
-            output.push(val.inner());
-        }
-    }
-
-    output
-}
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 #[cfg(test)]
-mod test {
-    use crate::utils::{generate_random_array, generate_runs};
-
+mod tests {
     use super::*;
 
-    #[test]
-    fn test_merge_with_tree_of_losers() {
-        let num_runs = 100;
-        let run_length = 10000;
-        let runs = generate_runs::<i32>(num_runs, run_length);
+    #[derive(Debug, Eq, PartialEq, PartialOrd, Ord)]
+    struct I32Value(i32);
 
-        let output = merge_with_tree_of_losers_no_sentinel(
-            runs.clone()
+    impl std::fmt::Display for I32Value {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.0)
+        }
+    }
+
+    impl SentinelValue for I32Value {
+        fn early_fence() -> Self {
+            I32Value(i32::MIN)
+        }
+        fn late_fence() -> Self {
+            I32Value(i32::MAX)
+        }
+        fn is_early_fence(&self) -> bool {
+            self.0 == i32::MIN
+        }
+        fn is_late_fence(&self) -> bool {
+            self.0 == i32::MAX
+        }
+    }
+
+    #[test]
+    fn test_push_returns_ownership() {
+        let values = vec![I32Value(10), I32Value(5), I32Value(20)];
+        let mut tree = LoserTree::new(values);
+
+        assert_eq!(tree.peek(), Some((&I32Value(5), 1)));
+        let old = tree.push(I32Value(50));
+        assert_eq!(old, I32Value(5));
+        assert_eq!(tree.peek(), Some((&I32Value(10), 0)));
+    }
+
+    #[test]
+    fn test_k_way_merge_correctness() {
+        let list1 = vec![1, 10, 20];
+        let list2 = vec![5, 15, 25];
+        let list3 = vec![2, 8, 30];
+
+        let mut iters = vec![list1.into_iter(), list2.into_iter(), list3.into_iter()];
+        let mut initial_heads = Vec::new();
+        for iter in iters.iter_mut() {
+            if let Some(val) = iter.next() {
+                initial_heads.push(I32Value(val));
+            }
+        }
+
+        let mut tree = LoserTree::new(initial_heads);
+        let mut result = Vec::new();
+
+        while let Some((_, source_idx)) = tree.peek() {
+            if let Some(next_val) = iters[source_idx].next() {
+                let winner = tree.push(I32Value(next_val));
+                result.push(winner);
+            } else {
+                if let Some(winner) = tree.mark_current_exhausted() {
+                    result.push(winner);
+                }
+            }
+        }
+
+        assert_eq!(
+            result,
+            vec![1, 2, 5, 8, 10, 15, 20, 25, 30]
                 .into_iter()
-                .map(|run| Box::new(run.into_iter()))
-                .collect(),
+                .map(I32Value)
+                .collect::<Vec<_>>()
         );
+    }
 
-        // Check the output.
-        let mut expected_output = runs.into_iter().flatten().collect::<Vec<_>>();
-        expected_output.sort();
+    // =============================================================================
+    // Update Functionality Tests
+    // =============================================================================
 
-        assert_eq!(output, expected_output);
+    #[test]
+    fn test_update_decrease_key_becomes_winner() {
+        // Initial: [10, 20, 30, 40]
+        // Tree Winner: 10 (idx 0)
+        let values = vec![I32Value(10), I32Value(20), I32Value(30), I32Value(40)];
+        let mut tree = LoserTree::new(values);
+
+        assert_eq!(tree.peek().unwrap().0, &I32Value(10));
+
+        // Update idx 3 (value 40) to 5. It should become the new winner.
+        let old = tree.update(3, I32Value(5));
+        assert_eq!(old, I32Value(40));
+
+        let (val, idx) = tree.peek().unwrap();
+        assert_eq!(val, &I32Value(5));
+        assert_eq!(idx, 3);
     }
 
     #[test]
-    fn test_sort_with_tree_of_losers() {
-        let run_length = 10000;
-        let mut run = generate_random_array::<i32>(run_length);
+    fn test_update_decrease_key_still_loser() {
+        // Initial: [10, 50, 60, 70]
+        // Winner: 10
+        let values = vec![I32Value(10), I32Value(50), I32Value(60), I32Value(70)];
+        let mut tree = LoserTree::new(values);
 
-        let output = sort_with_tree_of_losers_no_sentinel(run.clone());
+        // Update idx 1 (50) to 20. It's smaller than 50, but still larger than 10.
+        // It should NOT become winner.
+        let old = tree.update(1, I32Value(20));
+        assert_eq!(old, I32Value(50));
 
-        // Check the output.
-        run.sort();
+        let (val, idx) = tree.peek().unwrap();
+        assert_eq!(val, &I32Value(10)); // Winner unchanged
+        assert_eq!(idx, 0);
 
-        let output = output.into_iter().collect::<Vec<_>>();
-
-        assert_eq!(output, run);
+        // If we pop 10, next winner should be 20.
+        tree.push(I32Value(100)); // 0 becomes 100
+        let (val, idx) = tree.peek().unwrap();
+        assert_eq!(val, &I32Value(20)); // Our updated value wins now
+        assert_eq!(idx, 1);
     }
 
     #[test]
-    fn test_pretty_print_small_tree() {
-        use crate::entry::Sentineled;
+    fn test_update_increase_key() {
+        // Initial: [10, 20, 30, 40]
+        // Winner: 10
+        let values = vec![I32Value(10), I32Value(20), I32Value(30), I32Value(40)];
+        let mut tree = LoserTree::new(values);
 
-        // Test with 3 runs
-        println!("\n=== Testing pretty_print with 3 runs ===");
-        let mut tree = TreeOfLosers::<Sentineled<i32>>::new(3);
+        // Update idx 0 (Winner) to 100.
+        // This is effectively the same as push(100).
+        let old = tree.update(0, I32Value(100));
+        assert_eq!(old, I32Value(10));
 
-        // Show initial state with early fences
-        println!("\nInitial tree (all early fences):");
-        tree.pretty_print();
+        // New winner should be 20 (idx 1).
+        let (val, idx) = tree.peek().unwrap();
+        assert_eq!(val, &I32Value(20));
+        assert_eq!(idx, 1);
 
-        // Insert some values
-        tree.pop_and_insert(0, Some(Sentineled::new(10)));
-        tree.pop_and_insert(1, Some(Sentineled::new(5)));
-        tree.pop_and_insert(2, Some(Sentineled::new(15)));
-
-        println!("\nAfter inserting values 10, 5, 15:");
-        tree.pretty_print();
+        // Update idx 1 (Winner) to 50.
+        // New winner should be 30 (idx 2).
+        tree.update(1, I32Value(50));
+        let (val, idx) = tree.peek().unwrap();
+        assert_eq!(val, &I32Value(30));
+        assert_eq!(idx, 2);
     }
 
     #[test]
-    fn test_pretty_print_medium_tree() {
-        use crate::entry::Sentineled;
+    fn test_update_arbitrary_node_increase() {
+        // Initial: [10, 20, 30, 40]
+        let values = vec![I32Value(10), I32Value(20), I32Value(30), I32Value(40)];
+        let mut tree = LoserTree::new(values);
 
-        // Test with 5 runs
-        println!("\n=== Testing pretty_print with 5 runs ===");
-        let mut tree = TreeOfLosers::<Sentineled<i32>>::new(5);
+        // Update idx 2 (30) to 200.
+        // It wasn't the winner, and it still won't be.
+        let old = tree.update(2, I32Value(200));
+        assert_eq!(old, I32Value(30));
 
-        // Show initial state
-        println!("\nInitial tree (all early fences):");
-        tree.pretty_print();
+        // Winner is still 10.
+        assert_eq!(tree.peek().unwrap().0, &I32Value(10));
 
-        // Insert values in order
-        let values = [20, 10, 30, 15, 25];
-        for (i, &val) in values.iter().enumerate() {
-            tree.pop_and_insert(i, Some(Sentineled::new(val)));
+        // Pop 10 -> 500
+        tree.push(I32Value(500));
+        // Next is 20
+        assert_eq!(tree.peek().unwrap().0, &I32Value(20));
+        // Pop 20 -> 500
+        tree.push(I32Value(500));
+        // Next is 40
+        assert_eq!(tree.peek().unwrap().0, &I32Value(40));
+        // Pop 40 -> 500
+        tree.push(I32Value(500));
+        // Next is 200 (our updated value)
+        assert_eq!(tree.peek().unwrap().0, &I32Value(200));
+        assert_eq!(tree.peek().unwrap().1, 2);
+    }
+
+    #[test]
+    fn test_randomized_stress_updates() {
+        // Simple Linear Congruential Generator for deterministic randomness
+        struct SimpleRng {
+            state: u64,
+        }
+        impl SimpleRng {
+            fn new(seed: u64) -> Self {
+                Self { state: seed }
+            }
+            fn next_u32(&mut self) -> u32 {
+                self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (self.state >> 32) as u32
+            }
+            fn gen_range(&mut self, min: i32, max: i32) -> i32 {
+                let range = (max - min) as u32;
+                min + (self.next_u32() % range) as i32
+            }
         }
 
-        println!("\nAfter inserting values [20, 10, 30, 15, 25]:");
-        tree.pretty_print();
+        let k = 50;
+        let iterations = 2000;
+        let mut rng = SimpleRng::new(12345);
+
+        // Ground truth state: A vector representing the current value at each source index.
+        let mut current_values: Vec<i32> = (0..k).map(|_| rng.gen_range(0, 10000)).collect();
+
+        // Initialize tree
+        let tree_values: Vec<I32Value> = current_values.iter().map(|&x| I32Value(x)).collect();
+        let mut tree = LoserTree::new(tree_values);
+
+        for _ in 0..iterations {
+            // 1. Verify Property: Tree Peek vs Ground Truth Min
+            let (tree_min, tree_idx) = tree.peek().unwrap();
+
+            // Find ground truth min
+            let (_idx, gt_min) = current_values
+                .iter()
+                .enumerate()
+                .min_by_key(|&(_, &val)| val)
+                .unwrap();
+
+            assert_eq!(
+                tree_min.0, *gt_min,
+                "Tree minimum value does not match ground truth minimum at iteration"
+            );
+
+            // Check that the returned index actually holds that value
+            // (Note: We don't check tree_idx == gt_idx strictly because duplicate values might
+            // result in different winner indices depending on tournament structure, but the VALUE must match).
+            assert_eq!(
+                current_values[tree_idx], tree_min.0,
+                "Tree returned index does not hold the returned value in ground truth"
+            );
+
+            // 2. Perform Random Update
+            // Pick a random source index
+            let update_idx = rng.gen_range(0, k as i32) as usize;
+            // Pick a new random value
+            let new_val = rng.gen_range(0, 10000);
+
+            // Update ground truth
+            current_values[update_idx] = new_val;
+
+            // Update tree
+            tree.update(update_idx, I32Value(new_val));
+        }
     }
 
     #[test]
-    fn test_pretty_print_large_tree() {
-        use crate::entry::Sentineled;
+    fn test_visualizer() {
+        let values = vec![I32Value(15), I32Value(8), I32Value(23), I32Value(12)];
+        let tree = LoserTree::new(values);
 
-        // Test with 7 runs - perfect for showing late fences
-        println!("\n=== Testing pretty_print with 7 runs ===");
-        let mut tree = TreeOfLosers::<Sentineled<i32>>::new(7);
+        // Test that visualizers don't panic and return non-empty strings
+        let compact = tree.compact_view();
+        assert!(!compact.is_empty());
+        assert!(compact.contains("W:"));
 
-        // Insert values
-        let values = [35, 10, 45, 20, 50, 15, 40];
-        for (i, &val) in values.iter().enumerate() {
-            tree.pop_and_insert(i, Some(Sentineled::new(val)));
-        }
+        let visual = tree.visualize();
+        assert!(!visual.is_empty());
+        assert!(visual.contains("Winner"));
+        assert!(visual.contains("Level"));
 
-        println!("\nTree with 7 runs (notice the late fence):");
-        tree.pretty_print();
+        let ascii = tree.ascii_tree();
+        assert!(!ascii.is_empty());
+        assert!(ascii.contains("WINNER"));
+        assert!(ascii.contains("LOSER"));
 
-        // Simulate exhausting one run
-        tree.pop_and_insert(1, None); // Insert late fence for run 1
+        // Print for manual inspection during test
+        println!("\n--- Compact View ---");
+        println!("{}", compact);
+        println!("\n--- Level View ---");
+        println!("{}", visual);
+        println!("\n--- ASCII Tree ---");
+        println!("{}", ascii);
 
-        println!("\nAfter exhausting run 1 (replaced with late fence):");
-        tree.pretty_print();
+        // Test empty tree
+        let empty_tree: LoserTree<I32Value> = LoserTree::new(vec![]);
+        assert_eq!(empty_tree.visualize(), "Empty Tree");
+        assert_eq!(empty_tree.compact_view(), "[]");
+        assert_eq!(empty_tree.ascii_tree(), "Empty Tree");
     }
 
     #[test]
-    fn test_print_comparison() {
-        use crate::entry::Sentineled;
+    fn test_geometric_subtree_property() {
+        // Test the geometric property: (leaf_idx >> level) == subtree_root
+        // This validates that we can determine if a leaf belongs to a subtree
+        // using bit-shifting operations in a complete binary tree.
 
-        // Compare old print vs pretty print
-        println!("\n=== Comparing print() vs pretty_print() ===");
-        let mut tree = TreeOfLosers::<Sentineled<i32>>::new(4);
+        // For a tree with capacity 8:
+        // Leaves are at indices 8-15 (capacity + run_id)
+        // Level 0: leaves (8-15)
+        // Level 1: parents (4-7)
+        // Level 2: parents (2-3)
+        // Level 3: root (1)
+        // Index 0: overall winner
 
-        let values = [25, 10, 30, 15];
-        for (i, &val) in values.iter().enumerate() {
-            tree.pop_and_insert(i, Some(Sentineled::new(val)));
+        // Binary representation examples:
+        // Leaf 8  = 0b1000, >> 1 = 0b0100 = 4
+        // Leaf 9  = 0b1001, >> 1 = 0b0100 = 4
+        // Leaf 10 = 0b1010, >> 1 = 0b0101 = 5
+        // Leaf 11 = 0b1011, >> 1 = 0b0101 = 5
+
+        println!("\n=== Testing Geometric Subtree Property ===");
+        println!("Property: (leaf_idx >> level) == subtree_root");
+        println!("This determines if a leaf belongs to a subtree\n");
+
+        let capacity = 8;
+
+        // Helper to print binary analysis
+        let print_check = |leaf_idx: usize, level: usize, expected_root: usize| {
+            let computed = leaf_idx >> level;
+            let matches = computed == expected_root;
+            println!(
+                "Leaf {:2} (0b{:04b}) >> {} = {:2} (0b{:04b}) {} subtree_root {} - {}",
+                leaf_idx,
+                leaf_idx,
+                level,
+                computed,
+                computed,
+                if matches { "==" } else { "!=" },
+                expected_root,
+                if matches { "✓" } else { "✗" }
+            );
+            matches
+        };
+
+        // Test case 1: Leaf 8 (run_id 0) belongs to subtree rooted at 4 (level 1)
+        println!("Test 1: Level 1 - Children of node 4");
+        let leaf_idx = 8; // Leaf for run_id 0
+        let subtree_root = 4;
+        let level = 1;
+        assert!(print_check(leaf_idx, level, subtree_root));
+
+        // Test case 2: Leaf 9 also belongs to subtree rooted at 4 (level 1)
+        let leaf_idx = 9; // Leaf for run_id 1
+        assert!(print_check(leaf_idx, level, subtree_root));
+
+        // Test case 3: Leaf 10 should NOT belong to subtree rooted at 4
+        println!("\nTest 2: Negative check - Leaf 10 not in subtree 4");
+        let leaf_idx = 10; // Leaf for run_id 2
+        assert!(!print_check(leaf_idx, level, subtree_root));
+
+        // Test case 4: Leaf 10 belongs to subtree rooted at 5 (level 1)
+        println!("\nTest 3: Level 1 - Children of node 5");
+        let subtree_root = 5;
+        assert!(print_check(leaf_idx, level, subtree_root));
+        assert!(print_check(11, level, subtree_root));
+
+        // Test case 5: At level 2, leaves 8-11 belong to subtree rooted at 2
+        println!("\nTest 4: Level 2 - All children of node 2");
+        let level = 2;
+        let subtree_root = 2;
+        for run_id in 0..4 {
+            let leaf_idx = capacity + run_id;
+            assert!(print_check(leaf_idx, level, subtree_root));
         }
 
-        println!("\nUsing original print():");
-        tree.print();
-
-        println!("\nUsing pretty_print():");
-        tree.pretty_print();
-    }
-
-    // ============== Addressable PQ Tests ==============
-
-    #[test]
-    fn test_find_entry() {
-        use crate::entry::Sentineled;
-
-        println!("\n=== Testing find operation ===");
-        let mut tree = TreeOfLosers::<Sentineled<i32>>::new(5);
-
-        // Insert values
-        let values = [20, 10, 30, 15, 25];
-        for (i, &val) in values.iter().enumerate() {
-            tree.pop_and_insert(i, Some(Sentineled::new(val)));
+        // Test case 6: At level 2, leaves 12-15 do NOT belong to subtree rooted at 2
+        println!("\nTest 5: Level 2 - Non-children of node 2");
+        for run_id in 4..8 {
+            let leaf_idx = capacity + run_id;
+            assert!(!print_check(leaf_idx, level, subtree_root));
         }
 
-        println!("\nTree after insertions:");
-        tree.pretty_print();
-
-        // Test finding each entry
-        for (run_id, &expected_val) in values.iter().enumerate() {
-            let result = tree.find(run_id);
-            println!("\nSearching for run_id {}: {:?}", run_id, result);
-
-            // The entry should be found somewhere on the path
-            assert!(result.is_some());
-            let (found_val, slot) = result.unwrap();
-            assert_eq!(*found_val, Sentineled::new(expected_val));
-            println!("  Found at slot {}: {:?}", slot, found_val);
+        // Test case 7: At level 2, leaves 12-15 belong to subtree rooted at 3
+        println!("\nTest 6: Level 2 - All children of node 3");
+        let subtree_root = 3;
+        for run_id in 4..8 {
+            let leaf_idx = capacity + run_id;
+            assert!(print_check(leaf_idx, level, subtree_root));
         }
 
-        // Test finding non-existent entry
-        let result = tree.find(100);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_delete_entry() {
-        use crate::entry::Sentineled;
-
-        println!("\n=== Testing delete operation ===");
-        let mut tree = TreeOfLosers::<Sentineled<i32>>::new(5);
-
-        // Insert values
-        let values = [20, 10, 30, 15, 25];
-        for (i, &val) in values.iter().enumerate() {
-            tree.pop_and_insert(i, Some(Sentineled::new(val)));
+        // Test case 8: At level 3, all leaves belong to subtree rooted at 1 (root)
+        println!("\nTest 7: Level 3 - All leaves belong to root (node 1)");
+        let level = 3;
+        let subtree_root = 1;
+        for run_id in 0..8 {
+            let leaf_idx = capacity + run_id;
+            assert!(print_check(leaf_idx, level, subtree_root));
         }
 
-        println!("\nTree before deletion:");
-        tree.pretty_print();
+        // Test case 9: Different capacity (16)
+        println!("\n=== Testing with capacity 16 ===");
+        let capacity = 16;
+        let level = 2;
+        let subtree_root = 4; // Internal node at level 2
 
-        // Delete entry at run_id 1 (value 10, which should be at root)
-        let deleted = tree.delete(1);
-        println!("\nDeleted run_id 1: {:?}", deleted);
-        assert_eq!(deleted, Some(Sentineled::new(10)));
-
-        println!("\nTree after deleting run_id 1:");
-        tree.pretty_print();
-
-        // Verify we can't find it anymore
-        assert!(tree.find(1).is_none());
-
-        // Delete another entry (run_id 3, value 15)
-        let deleted = tree.delete(3);
-        println!("\nDeleted run_id 3: {:?}", deleted);
-        assert_eq!(deleted, Some(Sentineled::new(15)));
-
-        println!("\nTree after deleting run_id 3:");
-        tree.pretty_print();
-
-        // Try to delete non-existent entry
-        let deleted = tree.delete(100);
-        assert!(deleted.is_none());
-
-        // Try to delete already deleted entry
-        let deleted = tree.delete(1);
-        assert!(deleted.is_none());
-    }
-
-    #[test]
-    fn test_update_entry() {
-        use crate::entry::Sentineled;
-
-        println!("\n=== Testing update operation ===");
-        let mut tree = TreeOfLosers::<Sentineled<i32>>::new(5);
-
-        // Insert values
-        let values = [20, 10, 30, 15, 25];
-        for (i, &val) in values.iter().enumerate() {
-            tree.pop_and_insert(i, Some(Sentineled::new(val)));
+        // Subtree rooted at 4 should contain leaves 16-19 (run_id 0-3)
+        println!("\nTest 8: Capacity 16, Level 2 - Children of node 4");
+        for run_id in 0..4 {
+            let leaf_idx = capacity + run_id;
+            assert!(print_check(leaf_idx, level, subtree_root));
         }
 
-        println!("\nTree before update:");
-        tree.pretty_print();
-
-        // Update run_id 2 from 30 to 5 (should become new minimum)
-        let old_val = tree.update(2, Sentineled::new(5));
-        println!("\nUpdated run_id 2: old={:?}, new=5", old_val);
-        assert_eq!(old_val, Some(Sentineled::new(30)));
-
-        println!("\nTree after updating run_id 2 to 5:");
-        tree.pretty_print();
-
-        // Verify the new value is at root
-        assert_eq!(tree.entries[0].value, Sentineled::new(5));
-        assert_eq!(tree.entries[0].run_id, 2);
-
-        // Update run_id 4 from 25 to 100 (should move down)
-        let old_val = tree.update(4, Sentineled::new(100));
-        println!("\nUpdated run_id 4: old={:?}, new=100", old_val);
-        assert_eq!(old_val, Some(Sentineled::new(25)));
-
-        println!("\nTree after updating run_id 4 to 100:");
-        tree.pretty_print();
-
-        // Update non-existent entry
-        let old_val = tree.update(100, Sentineled::new(50));
-        assert!(old_val.is_none());
-    }
-
-    #[test]
-    fn test_addressable_pq_interleaved_ops() {
-        use crate::entry::Sentineled;
-
-        println!("\n=== Testing interleaved operations ===");
-        let mut tree = TreeOfLosers::<Sentineled<i32>>::new(7);
-
-        // Initial insertions
-        let values = [35, 10, 45, 20, 50, 15, 40];
-        for (i, &val) in values.iter().enumerate() {
-            tree.pop_and_insert(i, Some(Sentineled::new(val)));
+        // Leaves 20-23 should NOT belong to subtree rooted at 4
+        println!("\nTest 9: Capacity 16, Level 2 - Non-children of node 4");
+        for run_id in 4..8 {
+            let leaf_idx = capacity + run_id;
+            assert!(!print_check(leaf_idx, level, subtree_root));
         }
 
-        println!("\nInitial tree:");
-        tree.pretty_print();
-
-        // Pop minimum (should be 10, run_id 1)
-        let min = tree.pop_and_insert(1, Some(Sentineled::new(12)));
-        assert_eq!(min, Some(Sentineled::new(10)));
-        println!("\nAfter popping min and inserting 12 at run_id 1:");
-        tree.pretty_print();
-
-        // Delete an entry (run_id 3, value 20)
-        let deleted = tree.delete(3);
-        assert_eq!(deleted, Some(Sentineled::new(20)));
-        println!("\nAfter deleting run_id 3:");
-        tree.pretty_print();
-
-        // Update an entry (run_id 6, from 40 to 8)
-        let old = tree.update(6, Sentineled::new(8));
-        assert_eq!(old, Some(Sentineled::new(40)));
-        println!("\nAfter updating run_id 6 to 8:");
-        tree.pretty_print();
-
-        // New minimum should be 8
-        assert_eq!(tree.entries[0].value, Sentineled::new(8));
-
-        // Find an entry (run_id 4, value 50)
-        let found = tree.find(4);
-        assert!(found.is_some());
-        assert_eq!(*found.unwrap().0, Sentineled::new(50));
-        println!("\nFound run_id 4: {:?}", found);
-    }
-
-    #[test]
-    fn test_delete_all_entries() {
-        use crate::entry::Sentineled;
-
-        println!("\n=== Testing delete all entries ===");
-        let mut tree = TreeOfLosers::<Sentineled<i32>>::new(4);
-
-        // Insert values
-        let values = [25, 10, 30, 15];
-        for (i, &val) in values.iter().enumerate() {
-            tree.pop_and_insert(i, Some(Sentineled::new(val)));
-        }
-
-        println!("\nInitial tree:");
-        tree.pretty_print();
-
-        // Delete all entries
-        for i in 0..4 {
-            let deleted = tree.delete(i);
-            println!("\nDeleted run_id {}: {:?}", i, deleted);
-            assert!(deleted.is_some());
-        }
-
-        println!("\nTree after deleting all entries:");
-        tree.pretty_print();
-
-        // Root should now be a late fence
-        assert!(tree.entries[0].value.is_late_fence());
-    }
-
-    #[test]
-    fn test_update_to_same_value() {
-        use crate::entry::Sentineled;
-
-        let mut tree = TreeOfLosers::<Sentineled<i32>>::new(3);
-
-        // Insert values
-        tree.pop_and_insert(0, Some(Sentineled::new(10)));
-        tree.pop_and_insert(1, Some(Sentineled::new(20)));
-        tree.pop_and_insert(2, Some(Sentineled::new(30)));
-
-        // Update to same value
-        let old = tree.update(1, Sentineled::new(20));
-        assert_eq!(old, Some(Sentineled::new(20)));
-
-        // Tree should still be valid
-        assert_eq!(tree.entries[0].value, Sentineled::new(10));
+        println!("\n✓ All geometric property tests passed!");
     }
 }
