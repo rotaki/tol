@@ -11,20 +11,31 @@ impl<T: AsRef<[u8]>> RecordSize for T {
         self.as_ref().len()
     }
 }
-
 pub struct ReplacementSelection<T: Ord + SentinelValue + RecordSize> {
+    /// Tournament tree for efficient min-element extraction
     tree: LoserTree<T>,
+
+    /// Buffer for records destined for the next sorted run
     next_run_buffer: Vec<T>,
 
-    // Tracks empty slots (LateFences) in the tree for reuse
+    /// Available padding slots in the tree (indices between num_elements and capacity)
     late_fence_slots: Vec<usize>,
 
+    /// Maximum allowed memory usage in bytes
     workspace_size: usize,
+
+    /// Current memory usage in bytes
     used_space: usize,
+
+    /// Whether the tree has been initialized via build()
     initialized: bool,
 }
 
 impl<T: Ord + SentinelValue + RecordSize> ReplacementSelection<T> {
+    /// Create a new replacement selection instance with the specified workspace size.
+    ///
+    /// # Arguments
+    /// * `workspace_size` - Maximum memory (in bytes) that can be used for buffering
     pub fn new(workspace_size: usize) -> Self {
         Self {
             tree: LoserTree::new(vec![]),
@@ -36,78 +47,140 @@ impl<T: Ord + SentinelValue + RecordSize> ReplacementSelection<T> {
         }
     }
 
+    /// Insert an initial record before building the tree.
+    ///
+    /// This method can only be called before `build()`. Initial records form
+    /// the first sorted run.
+    ///
+    /// # Panics
+    /// Panics if called after `build()` has been invoked.
     pub fn insert_initial(&mut self, record: T) {
-        assert!(!self.initialized);
+        assert!(
+            !self.initialized,
+            "Cannot insert initial records after build is called"
+        );
         self.used_space += record.size();
         self.next_run_buffer.push(record);
     }
 
+    /// Build the initial tree from all inserted records.
+    ///
+    /// This transitions the data structure from setup phase to operational phase.
+    /// After calling this method, use `absorb_record()` to process new records.
+    ///
+    /// # Panics
+    /// Panics if called more than once.
     pub fn build(&mut self) {
-        assert!(!self.initialized);
-
-        // 1. Capture real size
-        let num_real = self.next_run_buffer.len();
-
-        // 2. Build tree
-        self.tree = LoserTree::new(std::mem::take(&mut self.next_run_buffer));
-
-        // 3. Optimization: Capture the 2^N padding slots immediately
-        let capacity = self.tree.capacity(); // Assumes you added the .capacity() accessor
-        for i in (num_real..capacity).rev() {
-            self.late_fence_slots.push(i);
-        }
-
+        assert!(!self.initialized, "build() may only be called once");
+        self.initialize_tree_from_buffer();
         self.initialized = true;
     }
 
+    /// Initialize the tree from the next run buffer and set up padding slots
+    fn initialize_tree_from_buffer(&mut self) {
+        let num_real = self.next_run_buffer.len();
+        let capacity = if num_real == 0 {
+            0
+        } else {
+            num_real.next_power_of_two()
+        };
+
+        self.tree = LoserTree::new(std::mem::take(&mut self.next_run_buffer));
+        self.late_fence_slots.clear();
+
+        // Capture padding slots (between num_real and next power of 2)
+        for i in (num_real..capacity).rev() {
+            self.late_fence_slots.push(i);
+        }
+    }
+
+    /// Absorb a new record into the replacement selection algorithm.
+    ///
+    /// Returns a vector of records that were evicted to make space.
+    /// The evicted records are guaranteed to be in sorted order within the current run.
     pub fn absorb_record(&mut self, record: T) -> Vec<T> {
-        assert!(self.initialized);
+        assert!(self.initialized, "absorb_record called before build()");
+
+        let mut record = record;
         let new_size = record.size();
         let mut output = Vec::new();
 
-        // --- Step 1: Decision Phase ---
+        // Ensure we have an active run to compare against
+        self.ensure_active_tree();
 
-        // We look at the top of the tree to decide the fate of the NEW record.
-        // We handle the "Empty Tree" case first to ensure we have a valid winner to compare against.
+        // Determine if the record belongs to current or next run
+        let belongs_to_next_run = self.should_defer_to_next_run(&mut record);
+
+        if belongs_to_next_run {
+            self.add_to_next_run(record);
+        } else {
+            self.add_to_current_run(record, &mut output);
+        }
+
+        self.used_space += new_size;
+
+        // Evict records until workspace constraint is satisfied
+        self.evict_until_space_available(&mut output);
+
+        output
+    }
+
+    /// Ensure there is an active tree to work with
+    fn ensure_active_tree(&mut self) {
         if self.tree.peek().is_none() {
             self.switch_run();
         }
+    }
 
-        // Logic:
-        // If the tree is still empty after switch (total exhaustion), decision is trivial (Current).
-        // Otherwise, we compare Input vs Winner.
-        // Note: We use peek() which gives &T. This avoids taking ownership yet.
-        let goes_to_future = if let Some((winner_ref, _)) = self.tree.peek() {
-            &record < winner_ref
+    /// Determine if a record should go to the next run
+    fn should_defer_to_next_run(&mut self, record: &T) -> bool {
+        if let Some((winner, _)) = self.tree.peek() {
+            record < winner
         } else {
-            // Tree is completely empty even after switch? Just insert into current.
             false
-        };
+        }
+    }
 
-        // --- Step 2: Eviction Phase ---
+    /// Add a record to the next run buffer
+    fn add_to_next_run(&mut self, record: T) {
+        self.next_run_buffer.push(record);
+    }
 
-        // We loop until we have enough space.
-        // We MUST evict at least once if the tree is full, but with variable sizes
-        // we might evict 0 times (if we have free slots) or N times.
+    /// Add a record to the current run tree
+    fn add_to_current_run(&mut self, record: T, output: &mut Vec<T>) {
+        let record_size = record.size();
+        let will_exceed = self.used_space + record_size > self.workspace_size;
 
-        // However, standard Replacement Selection usually implies a 1:1 swap logic.
-        // If we have free space (from padding), we might not evict anything.
-        // But if `used_space + new_size > workspace`, we MUST evict.
+        // Only use padding slots if we have memory headroom
+        // When memory is tight, prefer push interface which combines eviction + insertion in one pass
+        if !will_exceed {
+            if let Some(idx) = self.late_fence_slots.pop() {
+                // Use available padding slot (no eviction needed)
+                self.tree.update(idx, record);
+                return;
+            }
+        }
 
-        while self.used_space + new_size > self.workspace_size {
-            // Check if active tree ran out of nodes mid-eviction
+        // Memory tight OR no padding slots: use push interface
+        // This efficiently combines eviction and insertion in a single leaf-to-root pass
+        let winner = self.tree.push(record);
+        if !winner.is_late_fence() && !winner.is_early_fence() {
+            self.used_space -= winner.size();
+            output.push(winner);
+        }
+    }
+
+    /// Evict records until workspace size constraint is satisfied
+    fn evict_until_space_available(&mut self, output: &mut Vec<T>) {
+        while self.used_space > self.workspace_size {
+            self.ensure_active_tree();
+
             if self.tree.peek().is_none() {
-                self.switch_run();
-                // After switch, we might still need to evict from the NEW tree to make space
-                if self.tree.peek().is_none() {
-                    break;
-                } // Safety break
+                break; // No more records to evict
             }
 
             let (_, idx) = self.tree.peek().unwrap();
-
-            // Replace winner with LateFence (infinite value)
-            let winner = self.tree.update(idx, T::late_fence());
+            let winner = self.tree.push(T::late_fence());
 
             if !winner.is_late_fence() && !winner.is_early_fence() {
                 self.used_space -= winner.size();
@@ -115,81 +188,50 @@ impl<T: Ord + SentinelValue + RecordSize> ReplacementSelection<T> {
                 self.late_fence_slots.push(idx);
             }
         }
-
-        // --- Step 3: Insertion Phase ---
-
-        self.used_space += new_size;
-
-        if goes_to_future {
-            // New record is smaller than the winner we just replaced (or peeked).
-            // It cannot go into the current sorted run.
-            self.next_run_buffer.push(record);
-        } else {
-            // New record is >= winner. It extends the current run.
-            // Try to use a free slot (LateFence) in the tree.
-            if let Some(slot_idx) = self.late_fence_slots.pop() {
-                self.tree.update(slot_idx, record);
-            } else {
-                // No free slots. This shouldn't happen if we enforced space constraints above,
-                // unless the tree structure is static and we are trying to add more items
-                // than capacity allows (which buffer handles).
-                // Fallback: append to buffer or handle resize.
-                // In strict RS, we put it in buffer if tree is physically full.
-                self.next_run_buffer.push(record);
-            }
-        }
-
-        output
     }
 
-    /// Helper: Convert the Future Buffer into the Current Tree
+    /// Switch from current run to next run by rebuilding the tree
     fn switch_run(&mut self) {
         if self.next_run_buffer.is_empty() {
             return;
         }
-
-        // 1. Take buffer
-        let next_records = std::mem::take(&mut self.next_run_buffer);
-        let num_real = next_records.len();
-
-        // 2. Rebuild tree
-        self.tree = LoserTree::new(next_records);
-
-        // 3. Reset state
-        self.late_fence_slots.clear();
-
-        // 4. Capture padding slots for the new run
-        let capacity = self.tree.capacity();
-        for i in (num_real..capacity).rev() {
-            self.late_fence_slots.push(i);
-        }
+        self.initialize_tree_from_buffer();
     }
 
+    /// Drain all remaining records from both current and next runs.
+    ///
+    /// Returns all remaining records in sorted order within each run.
+    /// After draining, the data structure is ready to accept new initial records.
     pub fn drain(&mut self) -> Vec<T> {
         let mut output = Vec::new();
 
-        // Drain Current Tree
-        while self.tree.peek().is_some() {
-            let val = self.tree.push(T::late_fence());
-            if !val.is_late_fence() && !val.is_early_fence() {
-                output.push(val);
-            }
-        }
+        // Drain current tree
+        self.drain_current_tree(&mut output);
 
-        // Output remaining buffer (Next Run)
-        // Usually we sort this to keep the output clean, or return it as a separate chunk
-        if !self.next_run_buffer.is_empty() {
-            self.next_run_buffer.sort();
-            output.append(&mut self.next_run_buffer);
-        }
+        // Switch to next run and drain it as well
+        self.switch_run();
+        self.drain_current_tree(&mut output);
 
         output
     }
 
+    /// Helper to drain all records from the current tree
+    fn drain_current_tree(&mut self, output: &mut Vec<T>) {
+        while self.tree.peek().is_some() {
+            let val = self.tree.push(T::late_fence());
+            if !val.is_late_fence() && !val.is_early_fence() {
+                self.used_space -= val.size();
+                output.push(val);
+            }
+        }
+    }
+
+    /// Get the number of records currently in the next run buffer.
     pub fn buffer_len(&self) -> usize {
         self.next_run_buffer.len()
     }
 }
+
 
 #[cfg(test)]
 mod tests {
