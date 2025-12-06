@@ -4,10 +4,10 @@ use std::env;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{rngs::StdRng, Rng, SeedableRng};
 
 use tol::offset_value_coding::{
-    OVC64Trait, OVCEntry, SentinelValue, Sentineled, encode_runs_with_ovc64,
+    encode_runs_with_ovc64, OVC64Trait, OVCEntry, SentinelValue, Sentineled,
 };
 use tol::tree_of_losers::LoserTree;
 use tol::tree_of_losers_ovc::LoserTreeOVC;

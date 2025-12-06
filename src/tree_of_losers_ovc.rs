@@ -3,6 +3,33 @@ use std::mem;
 
 use crate::offset_value_coding::{OVC64Trait, OVCEntry, OVCU64, SentinelValue};
 
+#[cfg(feature = "instrument_calls")]
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+#[cfg(feature = "instrument_calls")]
+static PUSH_DATA_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "instrument_calls")]
+static PUSH_LATE_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "instrument_calls")]
+static UPDATE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "instrument_calls")]
+#[inline]
+pub fn reset_push_update_counts() {
+    PUSH_DATA_CALLS.store(0, AtomicOrdering::Relaxed);
+    PUSH_LATE_CALLS.store(0, AtomicOrdering::Relaxed);
+    UPDATE_CALLS.store(0, AtomicOrdering::Relaxed);
+}
+
+#[cfg(feature = "instrument_calls")]
+#[inline]
+pub fn take_push_update_counts() -> (usize, usize, usize) {
+    let push_data = PUSH_DATA_CALLS.swap(0, AtomicOrdering::Relaxed);
+    let push_late = PUSH_LATE_CALLS.swap(0, AtomicOrdering::Relaxed);
+    let update = UPDATE_CALLS.swap(0, AtomicOrdering::Relaxed);
+    (push_data, push_late, update)
+}
+
 pub struct LoserTreeOVC<T> {
     // The tree nodes.
     // Index 0: Stores the overall Winner.
@@ -77,7 +104,16 @@ impl<T: OVC64Trait> LoserTreeOVC<T> {
 
     /// Replaces the current winner with `new_val`, replays the tournament,
     /// and returns the OLD winner value (ownership transferred).
+    /// The OVC of the new_val must be correctly initialized by the caller.
     pub fn push(&mut self, new_val: T) -> T {
+        #[cfg(feature = "instrument_calls")]
+        {
+            if new_val.is_late_fence() {
+                PUSH_LATE_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+            } else {
+                PUSH_DATA_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
         if self.nodes.is_empty() {
             panic!("Cannot push to an empty LoserTree");
         }
@@ -91,6 +127,10 @@ impl<T: OVC64Trait> LoserTreeOVC<T> {
     /// This supports both increasing and decreasing the key.
     /// Returns the old value that was previously stored for `source_idx`.
     pub fn update(&mut self, source_idx: usize, new_val: T) -> T {
+        #[cfg(feature = "instrument_calls")]
+        {
+            UPDATE_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+        }
         if self.nodes.is_empty() {
             panic!("Cannot update empty tree");
         }
@@ -580,7 +620,9 @@ pub fn sort_with_tree_of_losers_with_ovc64(run: Vec<Vec<u8>>) -> Vec<OVCEntry> {
 #[cfg(test)]
 mod test {
     use crate::{
-        offset_value_coding::{encode_run_with_ovc64, encode_runs_with_ovc64},
+        offset_value_coding::{
+            encode_run_with_ovc64, encode_runs_with_ovc64, OVCEntryWithCounter,
+        },
         utils::generate_random_string_array,
     };
 
@@ -1951,5 +1993,42 @@ mod test {
         );
 
         println!("✓ Case 2 passed: Late fence handling works correctly");
+    }
+
+    #[test]
+    fn test_ovc_entry_with_counter_counts_byte_comparisons() {
+        // derive_ovc_from should count one comparison per byte
+        OVCEntryWithCounter::reset_byte_comparisons();
+        OVCEntryWithCounter::reset_ovc_comparisons();
+        let mut current = OVCEntryWithCounter::new(b"abf".to_vec());
+        let prev = OVCEntryWithCounter::new(b"abe".to_vec());
+        assert!(current.derive_ovc_from(&prev));
+        let derive_count = OVCEntryWithCounter::take_byte_comparisons();
+        let derive_ovc_cmp = OVCEntryWithCounter::take_ovc_comparisons();
+        assert_eq!(derive_count, 3);
+        assert_eq!(derive_ovc_cmp, 0);
+
+        // Tree operations should also tick the counter via compare_and_update/_with_mode
+        let mut tree = LoserTreeOVC::new(vec![
+            OVCEntryWithCounter::new(b"abc".to_vec()),
+            OVCEntryWithCounter::new(b"abd".to_vec()),
+        ]);
+
+        // Ignore construction comparisons
+        OVCEntryWithCounter::reset_byte_comparisons();
+        OVCEntryWithCounter::reset_ovc_comparisons();
+        let old = tree.push(OVCEntryWithCounter::new(b"abe".to_vec()));
+        let comparisons = OVCEntryWithCounter::take_byte_comparisons();
+        let ovc_comparisons = OVCEntryWithCounter::take_ovc_comparisons();
+
+        assert_eq!(old.get_key(), b"abc");
+        println!("Byte comparisons during push: {}", comparisons);
+        println!("OVC comparisons during push: {}", ovc_comparisons);
+        assert!(comparisons == 0); // push should not compare bytes
+        assert!(ovc_comparisons >= 1);
+
+        let (winner, idx) = tree.peek().unwrap();
+        assert_eq!(winner.get_key(), b"abd");
+        assert_eq!(idx, 1);
     }
 }

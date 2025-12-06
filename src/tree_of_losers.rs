@@ -2,6 +2,33 @@ use std::mem;
 
 use crate::offset_value_coding::SentinelValue;
 
+#[cfg(feature = "instrument_calls")]
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+#[cfg(feature = "instrument_calls")]
+static PUSH_DATA_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "instrument_calls")]
+static PUSH_LATE_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "instrument_calls")]
+static UPDATE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "instrument_calls")]
+#[inline]
+pub fn reset_push_update_counts() {
+    PUSH_DATA_CALLS.store(0, AtomicOrdering::Relaxed);
+    PUSH_LATE_CALLS.store(0, AtomicOrdering::Relaxed);
+    UPDATE_CALLS.store(0, AtomicOrdering::Relaxed);
+}
+
+#[cfg(feature = "instrument_calls")]
+#[inline]
+pub fn take_push_update_counts() -> (usize, usize, usize) {
+    let push_data = PUSH_DATA_CALLS.swap(0, AtomicOrdering::Relaxed);
+    let push_late = PUSH_LATE_CALLS.swap(0, AtomicOrdering::Relaxed);
+    let update = UPDATE_CALLS.swap(0, AtomicOrdering::Relaxed);
+    (push_data, push_late, update)
+}
+
 pub struct LoserTree<T> {
     // The tree nodes.
     // Index 0: Stores the overall Winner.
@@ -81,6 +108,14 @@ impl<T: Ord + SentinelValue> LoserTree<T> {
     /// Replaces the current winner with `new_val`, replays the tournament,
     /// and returns the OLD winner value (ownership transferred).
     pub fn push(&mut self, new_val: T) -> T {
+        #[cfg(feature = "instrument_calls")]
+        {
+            if new_val.is_late_fence() {
+                PUSH_LATE_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+            } else {
+                PUSH_DATA_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
         if self.nodes.is_empty() {
             panic!("Cannot push to an empty LoserTree");
         }
@@ -94,6 +129,10 @@ impl<T: Ord + SentinelValue> LoserTree<T> {
     /// This supports both increasing and decreasing the key.
     /// Returns the old value that was previously stored for `source_idx`.
     pub fn update(&mut self, source_idx: usize, new_val: T) -> T {
+        #[cfg(feature = "instrument_calls")]
+        {
+            UPDATE_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+        }
         if self.nodes.is_empty() {
             panic!("Cannot update empty tree");
         }
@@ -427,6 +466,8 @@ impl<T: Ord + SentinelValue> LoserTree<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cmp::Ordering;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     #[derive(Debug, Eq, PartialEq, PartialOrd, Ord)]
     struct I32Value(i32);
@@ -449,6 +490,87 @@ mod tests {
         }
         fn is_late_fence(&self) -> bool {
             self.0 == i32::MAX
+        }
+    }
+
+    // Tracks how many byte comparisons are evaluated for ordering.
+    #[derive(Clone, Debug)]
+    enum CountingBytes {
+        EarlyFence,
+        Value(Vec<u8>),
+        LateFence,
+    }
+
+    static ORDER_COMPARISON_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    impl CountingBytes {
+        fn value(bytes: impl Into<Vec<u8>>) -> Self {
+            Self::Value(bytes.into())
+        }
+
+        fn reset_comparisons() {
+            ORDER_COMPARISON_COUNT.store(0, AtomicOrdering::Relaxed);
+        }
+
+        fn take_comparisons() -> usize {
+            ORDER_COMPARISON_COUNT.swap(0, AtomicOrdering::Relaxed)
+        }
+    }
+
+    impl PartialEq for CountingBytes {
+        fn eq(&self, other: &Self) -> bool {
+            match (self, other) {
+                (CountingBytes::Value(a), CountingBytes::Value(b)) => a == b,
+                (CountingBytes::EarlyFence, CountingBytes::EarlyFence)
+                | (CountingBytes::LateFence, CountingBytes::LateFence) => true,
+                _ => false,
+            }
+        }
+    }
+
+    impl Eq for CountingBytes {}
+
+    impl PartialOrd for CountingBytes {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    impl Ord for CountingBytes {
+        fn cmp(&self, other: &Self) -> Ordering {
+            match (self, other) {
+                (CountingBytes::EarlyFence, CountingBytes::EarlyFence)
+                | (CountingBytes::LateFence, CountingBytes::LateFence) => Ordering::Equal,
+                (CountingBytes::EarlyFence, _) => Ordering::Less,
+                (_, CountingBytes::EarlyFence) => Ordering::Greater,
+                (CountingBytes::LateFence, _) => Ordering::Greater,
+                (_, CountingBytes::LateFence) => Ordering::Less,
+                (CountingBytes::Value(a), CountingBytes::Value(b)) => {
+                    for (a_byte, b_byte) in a.iter().zip(b.iter()) {
+                        ORDER_COMPARISON_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+                        match a_byte.cmp(b_byte) {
+                            Ordering::Equal => continue,
+                            non_eq => return non_eq,
+                        }
+                    }
+                    a.len().cmp(&b.len())
+                }
+            }
+        }
+    }
+
+    impl SentinelValue for CountingBytes {
+        fn early_fence() -> Self {
+            CountingBytes::EarlyFence
+        }
+        fn late_fence() -> Self {
+            CountingBytes::LateFence
+        }
+        fn is_early_fence(&self) -> bool {
+            matches!(self, CountingBytes::EarlyFence)
+        }
+        fn is_late_fence(&self) -> bool {
+            matches!(self, CountingBytes::LateFence)
         }
     }
 
@@ -823,5 +945,28 @@ mod tests {
         }
 
         println!("\n✓ All geometric property tests passed!");
+    }
+
+    #[test]
+    fn test_ord_comparisons_are_tracked() {
+        CountingBytes::reset_comparisons();
+
+        let mut tree = LoserTree::new(vec![
+            CountingBytes::value(b"abc"),
+            CountingBytes::value(b"abd"),
+        ]);
+
+        // Ignore the comparisons performed during tree construction.
+        CountingBytes::reset_comparisons();
+        let old = tree.update(0, CountingBytes::value(b"abe"));
+
+        let comparisons = CountingBytes::take_comparisons();
+
+        assert_eq!(old, CountingBytes::value(b"abc"));
+        assert_eq!(comparisons, 3); // a==a, b==b, e>d
+
+        let (winner, idx) = tree.peek().unwrap();
+        assert_eq!(winner, &CountingBytes::value(b"abd"));
+        assert_eq!(idx, 1);
     }
 }

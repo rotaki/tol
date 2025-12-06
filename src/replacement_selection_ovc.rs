@@ -252,6 +252,10 @@ mod tests {
     use rand::{Rng, SeedableRng, rngs::StdRng};
 
     use crate::offset_value_coding::is_ovc_consistent;
+    #[cfg(feature = "instrument_calls")]
+    use crate::tree_of_losers_ovc::{
+        reset_push_update_counts, take_push_update_counts,
+    };
 
     use super::*;
 
@@ -315,6 +319,30 @@ mod tests {
         assert_eq!(out[1].get_key()[1], 20);
         assert_eq!(out[2].get_key()[1], 30);
         assert_eq!(rs.used_space, 10);
+    }
+
+    #[cfg(feature = "instrument_calls")]
+    #[test]
+    fn test_absorb_record_uses_update_with_padding_and_headroom() {
+        let mut rs = ReplacementSelectionOVC::new(200);
+        rs.insert_initial(make_entry(10, 12));
+        rs.insert_initial(make_entry(20, 6));
+        rs.insert_initial(make_entry(30, 8)); // capacity=4 -> 1 padding slot
+
+        rs.build();
+        assert_eq!(rs.late_fence_slots.len(), 1);
+
+        reset_push_update_counts();
+        let out = rs.absorb_record(make_entry(40, 4)); // larger than current winner
+        let (push_data, push_late, updates) = take_push_update_counts();
+
+        assert!(out.is_empty(), "should not evict when padding slot is used");
+        assert_eq!(push_data + push_late, 0, "no push expected when padding slot exists");
+        assert_eq!(updates, 1, "update path should be taken once");
+        assert!(
+            rs.late_fence_slots.is_empty(),
+            "padding slot should be consumed after update"
+        );
     }
 
     #[test]

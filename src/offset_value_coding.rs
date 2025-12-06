@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use crate::replacement_selection_tol::RecordSize;
 
@@ -687,6 +688,313 @@ impl From<Vec<u8>> for OVCEntry {
     fn from(key: Vec<u8>) -> Self {
         let ovc = OVCU64::initial_value();
         Self { ovc, key }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Instrumented OVC entry that counts byte comparisons
+// ---------------------------------------------------------------------------
+
+static OVC_BYTE_COMPARISON_COUNT: AtomicUsize = AtomicUsize::new(0);
+static OVC_META_COMPARISON_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct OVCEntryWithCounter {
+    ovc: OVCU64,
+    key: Vec<u8>,
+}
+
+impl OVCEntryWithCounter {
+    pub fn new(key: Vec<u8>) -> Self {
+        Self {
+            ovc: OVCU64::initial_value(),
+            key,
+        }
+    }
+
+    pub fn get_ovc(&self) -> OVCU64 {
+        self.ovc
+    }
+
+    pub fn get_key(&self) -> &[u8] {
+        &self.key
+    }
+
+    pub fn reset_byte_comparisons() {
+        OVC_BYTE_COMPARISON_COUNT.store(0, AtomicOrdering::Relaxed);
+    }
+
+    pub fn take_byte_comparisons() -> usize {
+        OVC_BYTE_COMPARISON_COUNT.swap(0, AtomicOrdering::Relaxed)
+    }
+
+    pub fn reset_ovc_comparisons() {
+        OVC_META_COMPARISON_COUNT.store(0, AtomicOrdering::Relaxed);
+    }
+
+    pub fn take_ovc_comparisons() -> usize {
+        OVC_META_COMPARISON_COUNT.swap(0, AtomicOrdering::Relaxed)
+    }
+
+    #[inline]
+    fn counting_cmp(a: u8, b: u8) -> Ordering {
+        OVC_BYTE_COMPARISON_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+        a.cmp(&b)
+    }
+
+    #[inline]
+    fn counting_ovc_cmp(a: &OVCU64, b: &OVCU64) -> Ordering {
+        OVC_META_COMPARISON_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+        a.cmp(b)
+    }
+}
+
+impl OVC64Trait for OVCEntryWithCounter {
+    fn ovc(&self) -> &OVCU64 {
+        &self.ovc
+    }
+
+    fn ovc_mut(&mut self) -> &mut OVCU64 {
+        &mut self.ovc
+    }
+
+    fn key(&self) -> &Vec<u8> {
+        &self.key
+    }
+
+    fn derive_ovc_from(&mut self, prev: &Self) -> bool {
+        let min_len = self.key().len().min(prev.key().len());
+        for i in 0..min_len {
+            match Self::counting_cmp(self.key()[i], prev.key()[i]) {
+                Ordering::Less => {
+                    return false;
+                }
+                Ordering::Greater => {
+                    let aligned_offset = (i / OVC64_CHUNK_SIZE) * OVC64_CHUNK_SIZE;
+                    let chunk_end = (aligned_offset + OVC64_CHUNK_SIZE).min(self.key().len());
+                    *self.ovc_mut() = OVCU64::normal_value(
+                        &self.key()[aligned_offset..chunk_end],
+                        aligned_offset,
+                    );
+                    return true;
+                }
+                Ordering::Equal => continue,
+            }
+        }
+
+        match self.key().len().cmp(&prev.key().len()) {
+            Ordering::Greater => {
+                let aligned_offset = (prev.key().len() / OVC64_CHUNK_SIZE) * OVC64_CHUNK_SIZE;
+                let chunk_end = (aligned_offset + OVC64_CHUNK_SIZE).min(self.key().len());
+                *self.ovc_mut() =
+                    OVCU64::normal_value(&self.key()[aligned_offset..chunk_end], aligned_offset);
+            }
+            Ordering::Equal => {
+                *self.ovc_mut() = OVCU64::duplicate_value();
+            }
+            Ordering::Less => {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn compare_and_update(&mut self, other: &mut Self) -> Ordering {
+        let val_a = self.key();
+        let val_b = other.key();
+        let ovc_a = self.ovc();
+        let ovc_b = other.ovc();
+
+        match Self::counting_ovc_cmp(ovc_a, ovc_b) {
+            Ordering::Equal => {
+                if ovc_a.is_early_fence() || ovc_a.is_late_fence() || ovc_a.is_duplicate_value() {
+                    return Ordering::Equal;
+                }
+
+                let offset = ovc_a.offset();
+                let start_index =
+                    (!ovc_a.is_initial_value() as usize) * (offset + OVC64_CHUNK_SIZE);
+
+                let min_len = val_a.len().min(val_b.len());
+
+                for i in start_index..min_len {
+                    match Self::counting_cmp(val_a[i], val_b[i]) {
+                        Ordering::Equal => continue,
+                        Ordering::Less => {
+                            let aligned_offset = (i / OVC64_CHUNK_SIZE) * OVC64_CHUNK_SIZE;
+                            let chunk_end = (aligned_offset + OVC64_CHUNK_SIZE).min(val_b.len());
+                            *other.ovc_mut() = OVCU64::normal_value(
+                                &val_b[aligned_offset..chunk_end],
+                                aligned_offset,
+                            );
+                            return Ordering::Less;
+                        }
+                        Ordering::Greater => {
+                            let aligned_offset = (i / OVC64_CHUNK_SIZE) * OVC64_CHUNK_SIZE;
+                            let chunk_end = (aligned_offset + OVC64_CHUNK_SIZE).min(val_a.len());
+                            *self.ovc_mut() = OVCU64::normal_value(
+                                &val_a[aligned_offset..chunk_end],
+                                aligned_offset,
+                            );
+                            return Ordering::Greater;
+                        }
+                    }
+                }
+
+                match val_a.len().cmp(&val_b.len()) {
+                    Ordering::Greater => {
+                        let aligned_offset = (val_b.len() / OVC64_CHUNK_SIZE) * OVC64_CHUNK_SIZE;
+                        let chunk_end = (aligned_offset + OVC64_CHUNK_SIZE).min(val_a.len());
+                        *self.ovc_mut() =
+                            OVCU64::normal_value(&val_a[aligned_offset..chunk_end], aligned_offset);
+                        Ordering::Greater
+                    }
+                    Ordering::Less => {
+                        let aligned_offset = (val_a.len() / OVC64_CHUNK_SIZE) * OVC64_CHUNK_SIZE;
+                        let chunk_end = (aligned_offset + OVC64_CHUNK_SIZE).min(val_b.len());
+                        *other.ovc_mut() =
+                            OVCU64::normal_value(&val_b[aligned_offset..chunk_end], aligned_offset);
+                        Ordering::Less
+                    }
+                    Ordering::Equal => {
+                        *self.ovc_mut() = OVCU64::duplicate_value();
+                        Ordering::Equal
+                    }
+                }
+            }
+            ord => ord,
+        }
+    }
+
+    fn compare_and_update_with_mode(&mut self, other: &mut Self, full_comp: bool) -> Ordering {
+        if full_comp {
+            if self.is_late_fence() || self.is_early_fence() {
+                return Ordering::Greater;
+            }
+            if self.is_early_fence() || other.is_late_fence() {
+                return Ordering::Less;
+            }
+            let val_a = self.key();
+            let val_b = other.key();
+
+            let start_index = 0;
+            let min_len = val_a.len().min(val_b.len());
+
+            for i in start_index..min_len {
+                match Self::counting_cmp(val_a[i], val_b[i]) {
+                    Ordering::Equal => continue,
+                    Ordering::Less => {
+                        let aligned_offset = (i / OVC64_CHUNK_SIZE) * OVC64_CHUNK_SIZE;
+                        let chunk_end = (aligned_offset + OVC64_CHUNK_SIZE).min(val_b.len());
+                        *other.ovc_mut() =
+                            OVCU64::normal_value(&val_b[aligned_offset..chunk_end], aligned_offset);
+                        return Ordering::Less;
+                    }
+                    Ordering::Greater => {
+                        let aligned_offset = (i / OVC64_CHUNK_SIZE) * OVC64_CHUNK_SIZE;
+                        let chunk_end = (aligned_offset + OVC64_CHUNK_SIZE).min(val_a.len());
+                        *self.ovc_mut() =
+                            OVCU64::normal_value(&val_a[aligned_offset..chunk_end], aligned_offset);
+                        return Ordering::Greater;
+                    }
+                }
+            }
+
+            match val_a.len().cmp(&val_b.len()) {
+                Ordering::Greater => {
+                    let aligned_offset = (val_b.len() / OVC64_CHUNK_SIZE) * OVC64_CHUNK_SIZE;
+                    let chunk_end = (aligned_offset + OVC64_CHUNK_SIZE).min(val_a.len());
+                    *self.ovc_mut() =
+                        OVCU64::normal_value(&val_a[aligned_offset..chunk_end], aligned_offset);
+                    Ordering::Greater
+                }
+                Ordering::Less => {
+                    let aligned_offset = (val_a.len() / OVC64_CHUNK_SIZE) * OVC64_CHUNK_SIZE;
+                    let chunk_end = (aligned_offset + OVC64_CHUNK_SIZE).min(val_b.len());
+                    *other.ovc_mut() =
+                        OVCU64::normal_value(&val_b[aligned_offset..chunk_end], aligned_offset);
+                    Ordering::Less
+                }
+                Ordering::Equal => {
+                    *self.ovc_mut() = OVCU64::duplicate_value();
+                    Ordering::Equal
+                }
+            }
+        } else {
+            self.compare_and_update(other)
+        }
+    }
+}
+
+impl SentinelValue for OVCEntryWithCounter {
+    fn early_fence() -> Self {
+        Self {
+            ovc: OVCU64::early_fence(),
+            key: Vec::new(),
+        }
+    }
+
+    fn late_fence() -> Self {
+        Self {
+            ovc: OVCU64::late_fence(),
+            key: Vec::new(),
+        }
+    }
+
+    fn is_early_fence(&self) -> bool {
+        self.ovc.is_early_fence()
+    }
+
+    fn is_late_fence(&self) -> bool {
+        self.ovc.is_late_fence()
+    }
+}
+
+impl std::fmt::Debug for OVCEntryWithCounter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_early_fence() {
+            write!(f, "[EarlyFence]")
+        } else if self.is_late_fence() {
+            write!(f, "[LateFence]")
+        } else {
+            write!(f, "{} -> {:?}", self.ovc, self.key)
+        }
+    }
+}
+
+impl std::fmt::Display for OVCEntryWithCounter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_early_fence() {
+            write!(f, "[EarlyFence]")
+        } else if self.is_late_fence() {
+            write!(f, "[LateFence]")
+        } else {
+            write!(f, "{} -> {:?}", self.ovc, self.key)
+        }
+    }
+}
+
+impl From<Vec<u8>> for OVCEntryWithCounter {
+    fn from(key: Vec<u8>) -> Self {
+        Self {
+            ovc: OVCU64::initial_value(),
+            key,
+        }
+    }
+}
+
+impl From<OVCEntry> for OVCEntryWithCounter {
+    fn from(entry: OVCEntry) -> Self {
+        Self {
+            ovc: entry.get_ovc(),
+            key: entry.get_key().to_vec(),
+        }
+    }
+}
+
+impl RecordSize for OVCEntryWithCounter {
+    fn size(&self) -> usize {
+        self.key.len()
     }
 }
 

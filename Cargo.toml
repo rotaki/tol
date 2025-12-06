@@ -5,3 +5,17 @@ edition = "2024"
 
 [dependencies]
 rand = "0.9.2"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[features]
+instrument_calls = []
+
+[[bench]]
+name = "merge_bench"
+harness = false
+
+[[bench]]
+name = "replacement_selection_bench"
+harness = false
