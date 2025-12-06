@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-use crate::replacement_selection::RecordSize;
+use crate::replacement_selection_tol::RecordSize;
 
 /// Replacement selection driven by a binary heap instead of a tournament tree.
 ///
@@ -207,7 +207,7 @@ impl<T: Ord + RecordSize> ReplacementSelectionHeap<T> {
 mod tests {
     use std::{cmp::Ordering, fmt::Debug};
 
-    use rand::{rngs::StdRng, Rng, SeedableRng};
+    use rand::{Rng, SeedableRng, rngs::StdRng};
 
     use super::*;
 
@@ -376,6 +376,9 @@ mod tests {
         }
 
         assert_eq!(full_output.len(), num_elements, "Output count mismatch");
-        assert!(run_count > 1, "Should produce multiple runs given small workspace");
+        assert!(
+            run_count > 1,
+            "Should produce multiple runs given small workspace"
+        );
     }
 }

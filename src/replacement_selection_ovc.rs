@@ -1,5 +1,5 @@
 use crate::offset_value_coding::{OVC64Trait, OVCEntry, OVCU64};
-use crate::replacement_selection::RecordSize;
+use crate::replacement_selection_tol::RecordSize;
 use crate::tree_of_losers_ovc::LoserTreeOVC;
 
 /// Replacement selection algorithm with Offset Value Coding (OVC) optimization.

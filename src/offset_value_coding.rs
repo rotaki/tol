@@ -1,5 +1,7 @@
 use std::cmp::Ordering;
 
+use crate::replacement_selection_tol::RecordSize;
+
 pub trait SentinelValue {
     fn early_fence() -> Self;
     fn late_fence() -> Self;
@@ -13,6 +15,15 @@ pub enum Sentineled<T: Ord> {
     Early,
     Normal(T),
     Late,
+}
+
+impl<T: Ord + RecordSize> RecordSize for Sentineled<T> {
+    fn size(&self) -> usize {
+        match self {
+            Sentineled::Early | Sentineled::Late => 0,
+            Sentineled::Normal(value) => value.size(),
+        }
+    }
 }
 
 impl<T: Ord + std::fmt::Display> std::fmt::Display for Sentineled<T> {

@@ -11,7 +11,7 @@ impl<T: AsRef<[u8]>> RecordSize for T {
         self.as_ref().len()
     }
 }
-pub struct ReplacementSelection<T: Ord + SentinelValue + RecordSize> {
+pub struct ReplacementSelectionToL<T: Ord + SentinelValue + RecordSize> {
     /// Tournament tree for efficient min-element extraction
     tree: LoserTree<T>,
 
@@ -31,7 +31,7 @@ pub struct ReplacementSelection<T: Ord + SentinelValue + RecordSize> {
     initialized: bool,
 }
 
-impl<T: Ord + SentinelValue + RecordSize> ReplacementSelection<T> {
+impl<T: Ord + SentinelValue + RecordSize> ReplacementSelectionToL<T> {
     /// Create a new replacement selection instance with the specified workspace size.
     ///
     /// # Arguments
@@ -232,7 +232,6 @@ impl<T: Ord + SentinelValue + RecordSize> ReplacementSelection<T> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::{cmp::Ordering, fmt::Debug};
@@ -241,7 +240,7 @@ mod tests {
 
     use crate::{
         offset_value_coding::SentinelValue,
-        replacement_selection::{RecordSize, ReplacementSelection},
+        replacement_selection_tol::{RecordSize, ReplacementSelectionToL},
     };
 
     pub struct TestRecord {
@@ -313,7 +312,7 @@ mod tests {
         // Workspace is large enough to not force eviction.
         // The algorithm should use the free slot instead of evicting.
 
-        let mut rs = ReplacementSelection::new(100); // 100 bytes capacity
+        let mut rs = ReplacementSelectionToL::new(100); // 100 bytes capacity
         rs.insert_initial(TestRecord::new(10, 10));
         rs.insert_initial(TestRecord::new(20, 10));
         rs.insert_initial(TestRecord::new(30, 10));
@@ -350,7 +349,7 @@ mod tests {
         // 5 < 10. 5 CANNOT go to current run.
         // 5 should go to buffer. 10 should be evicted.
 
-        let mut rs = ReplacementSelection::new(20); // Tight space. Holds 2 items of size 10.
+        let mut rs = ReplacementSelectionToL::new(20); // Tight space. Holds 2 items of size 10.
         rs.insert_initial(TestRecord::new(10, 10));
         rs.insert_initial(TestRecord::new(20, 10));
         rs.build();
@@ -376,7 +375,7 @@ mod tests {
         // Absorb 1 large item (size 6).
         // Must evict 3 small items to fit the large one.
 
-        let mut rs = ReplacementSelection::new(10);
+        let mut rs = ReplacementSelectionToL::new(10);
         for i in 1..=5 {
             rs.insert_initial(TestRecord::new(i * 10, 2));
         }
@@ -411,7 +410,7 @@ mod tests {
         // Evict 10. Tree empty.
         // Should auto-switch to [5].
 
-        let mut rs = ReplacementSelection::new(19);
+        let mut rs = ReplacementSelectionToL::new(19);
         rs.insert_initial(TestRecord::new(10, 10)); // Tree
         rs.build();
 
@@ -456,7 +455,7 @@ mod tests {
         let workspace_size = workspace_capacity_items * item_size;
         let num_elements = 1000;
 
-        let mut rs = ReplacementSelection::new(workspace_size);
+        let mut rs = ReplacementSelectionToL::new(workspace_size);
 
         // Generate data
         let mut data: Vec<TestRecord> = (0..num_elements)

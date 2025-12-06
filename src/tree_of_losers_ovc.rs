@@ -118,16 +118,13 @@ impl<T: OVC64Trait> LoserTreeOVC<T> {
         let mut candidate = Node::new(key, index);
         let mut slot = Self::parent_index(self.leaf_index(index));
 
-        // --- PHASE 1: Standard Loser Tree Climb ---
         while slot != self.root_index() {
-            // Note: We use &mut self.nodes[slot].key so the tree node can update its OVC if it loses.
             if self.nodes[slot].key.compare_and_update(&mut candidate.key) == Ordering::Less {
                 mem::swap(&mut candidate, &mut self.nodes[slot]);
             }
             slot = Self::parent_index(slot);
         }
 
-        // Final placement swaps the candidate into the root.
         let old_node_to_return = mem::replace(&mut self.nodes[slot], candidate);
         old_node_to_return
     }
